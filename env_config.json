@@ -1,0 +1,22 @@
+{
+    "olt_ip": "10.100.0.7",
+    "username": "isadmin",
+    "password": "ans#150",
+    "protocol": "telnet",
+    "ont_serial": "HUMA23084463",
+    "chanpair": "1/1/1/5",
+    "pon": "ng2:5/1",
+    "ont_id": "3",
+    "ont_type": "sfu",
+    "lan_ports": "1",
+    "max_mac": "16",
+    "bw_profile": "NG2DATABWUP10000",
+    "network_type": "traffic",
+    "vlan_id": "4000",
+    "stc_chassis": "221.140.31.117",
+    "stc_tx_port": "2/1",
+    "stc_rx_port": "2/2",
+    "stc_frame_size": "1518",
+    "stc_load": "100",
+    "stc_duration": "600"
+}
