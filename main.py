@@ -30,107 +30,101 @@ class DatabaseManager:
         self._initialize_database()
 
     def _initialize_database(self):
-        conn = sqlite3.connect(self.db_name)
-        cursor = conn.cursor()
-        
-        cursor.execute('''CREATE TABLE IF NOT EXISTS ont_inventory (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, serial_number TEXT UNIQUE, 
-            pon_port TEXT, ont_id TEXT, status TEXT, provisioning_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
-        
-        cursor.execute('''CREATE TABLE IF NOT EXISTS test_cases (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, target_serial TEXT, execution_order INTEGER, 
-            test_type TEXT, command TEXT, parameters TEXT, expected_output TEXT, 
-            success_count INTEGER DEFAULT 0, is_evolved BOOLEAN DEFAULT 0)''')
+        with sqlite3.connect(self.db_name, timeout=20) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''CREATE TABLE IF NOT EXISTS ont_inventory (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, serial_number TEXT UNIQUE, 
+                pon_port TEXT, ont_id TEXT, status TEXT, provisioning_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
             
-        cursor.execute('''CREATE TABLE IF NOT EXISTS learned_commands (
-            olt_profile TEXT, test_type TEXT, command_template TEXT, PRIMARY KEY (olt_profile, test_type))''')
-            
-        conn.commit()
-        conn.close()
+            cursor.execute('''CREATE TABLE IF NOT EXISTS test_cases (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, target_serial TEXT, execution_order INTEGER, 
+                test_type TEXT, command TEXT, parameters TEXT, expected_output TEXT, 
+                success_count INTEGER DEFAULT 0, is_evolved BOOLEAN DEFAULT 0)''')
+                
+            cursor.execute('''CREATE TABLE IF NOT EXISTS learned_commands (
+                olt_profile TEXT, test_type TEXT, command_template TEXT, PRIMARY KEY (olt_profile, test_type))''')
+            conn.commit()
 
     def add_ont(self, serial: str, pon: str, ont_id: str, status: str):
-        conn = sqlite3.connect(self.db_name)
-        cursor = conn.cursor()
-        cursor.execute('INSERT OR REPLACE INTO ont_inventory (serial_number, pon_port, ont_id, status) VALUES (?, ?, ?, ?)', 
-                       (serial, pon, ont_id, status))
-        conn.commit()
-        conn.close()
+        with sqlite3.connect(self.db_name, timeout=20) as conn:
+            cursor = conn.cursor()
+            cursor.execute('INSERT OR REPLACE INTO ont_inventory (serial_number, pon_port, ont_id, status) VALUES (?, ?, ?, ?)', 
+                           (serial, pon, ont_id, status))
+            conn.commit()
 
     def get_learned_command(self, profile: str, t_type: str) -> str:
-        conn = sqlite3.connect(self.db_name)
-        cursor = conn.cursor()
-        cursor.execute('SELECT command_template FROM learned_commands WHERE olt_profile = ? AND test_type = ?', (profile, t_type))
-        row = cursor.fetchone()
-        conn.close()
-        return row[0] if row else None
+        with sqlite3.connect(self.db_name, timeout=20) as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT command_template FROM learned_commands WHERE olt_profile = ? AND test_type = ?', (profile, t_type))
+            row = cursor.fetchone()
+            return row[0] if row else None
 
     def save_learned_command(self, profile: str, t_type: str, template: str):
-        conn = sqlite3.connect(self.db_name)
-        cursor = conn.cursor()
-        cursor.execute('INSERT OR REPLACE INTO learned_commands (olt_profile, test_type, command_template) VALUES (?, ?, ?)', 
-                       (profile, t_type, template))
-        conn.commit()
-        conn.close()
+        with sqlite3.connect(self.db_name, timeout=20) as conn:
+            cursor = conn.cursor()
+            cursor.execute('INSERT OR REPLACE INTO learned_commands (olt_profile, test_type, command_template) VALUES (?, ?, ?)', 
+                           (profile, t_type, template))
+            conn.commit()
 
     def update_test_case(self, t_id: int, cmd: str, params: str):
-        conn = sqlite3.connect(self.db_name)
-        cursor = conn.cursor()
-        cursor.execute('UPDATE test_cases SET command = ?, parameters = ? WHERE id = ?', (cmd, params, t_id))
-        conn.commit()
-        conn.close()
+        with sqlite3.connect(self.db_name, timeout=20) as conn:
+            cursor = conn.cursor()
+            cursor.execute('UPDATE test_cases SET command = ?, parameters = ? WHERE id = ?', (cmd, params, t_id))
+            conn.commit()
 
     def mark_test_success(self, test_id: int):
-        conn = sqlite3.connect(self.db_name)
-        cursor = conn.cursor()
-        cursor.execute("UPDATE test_cases SET success_count = success_count + 1 WHERE id = ?", (test_id,))
-        cursor.execute("UPDATE test_cases SET is_evolved = 1 WHERE id = ? AND success_count >= 1", (test_id,))
-        conn.commit()
-        conn.close()
+        with sqlite3.connect(self.db_name, timeout=20) as conn:
+            cursor = conn.cursor()
+            cursor.execute("UPDATE test_cases SET success_count = success_count + 1 WHERE id = ?", (test_id,))
+            cursor.execute("UPDATE test_cases SET is_evolved = 1 WHERE id = ? AND success_count >= 1", (test_id,))
+            conn.commit()
 
     def load_test_cases(self, serial: str) -> List[Dict]:
-        conn = sqlite3.connect(self.db_name)
-        cursor = conn.cursor()
-        cursor.execute('SELECT id, target_serial, execution_order, test_type, command, parameters FROM test_cases WHERE target_serial = ? ORDER BY execution_order ASC', (serial,))
-        rows = cursor.fetchall()
-        conn.close()
-        return [{"id": r[0], "serial": r[1], "order": r[2], "type": r[3], "command": r[4], "parameters": json.loads(r[5])} for r in rows]
+        with sqlite3.connect(self.db_name, timeout=20) as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT id, target_serial, execution_order, test_type, command, parameters FROM test_cases WHERE target_serial = ? ORDER BY execution_order ASC', (serial,))
+            rows = cursor.fetchall()
+            return [{"id": r[0], "serial": r[1], "order": r[2], "type": r[3], "command": r[4], "parameters": json.loads(r[5])} for r in rows]
 
     def add_initial_test_cases(self, config: Dict, profile: str):
-        conn = sqlite3.connect(self.db_name)
-        cursor = conn.cursor()
-        
+        # 1. Reset broken Ranging_Test dynamically to avoid lock
+        current_ranging_cmd = self.get_learned_command(profile, "Ranging_Test")
+        if current_ranging_cmd and "{chanpair}" not in current_ranging_cmd:
+            logging.warning("Hardcoded Ranging_Test command detected. Resetting to dynamic template.")
+            self.save_learned_command(profile, "Ranging_Test", "show equipment ont status channel-pair {chanpair}")
+
         serial = config['ont_serial']
         pon = config['pon']
         ont_id = config['ont_id']
         chanpair = config.get('chanpair', '')
-        
         port_full = f"{pon}/{ont_id}"
         vendor_id = serial[:4]
         sn_rem = serial[4:]
         serial_formatted = f"{vendor_id}:{sn_rem}"
-        
-        cursor.execute("SELECT COUNT(*) FROM test_cases WHERE target_serial = ?", (serial,))
-        count = cursor.fetchone()[0]
-        
-        if count < 9:
-            if count > 0:
-                cursor.execute("DELETE FROM test_cases WHERE target_serial = ?", (serial,))
-                
+
+        # 2. Safely perform bulk insert in a unified transaction
+        with sqlite3.connect(self.db_name, timeout=20) as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM test_cases WHERE target_serial = ?", (serial,))
+                    
             templates = {
                 "OLT_Version_Check": "show version",
                 "Ranging_Test": "show equipment ont status channel-pair {chanpair}", 
                 "Optics_Check": "show equipment ont optics {port}",
                 "UNI_Status": "show equipment ont interface {port}",
                 "Software_Info": "show equipment ont sw-version {port}",
-                "STC_Traffic_Test": "stc_test.py",
+                "Speed_Test": "speed_test.py", 
                 "MAC_Status": "show vlan bridge-port-fdb {port}/1/1",
                 "Reboot_Test": "admin equipment ont interface {port} reboot",
                 "Cleanup": "configure equipment ont interface no sernum {port}"
             }
             
+            cursor.execute('SELECT test_type, command_template FROM learned_commands WHERE olt_profile = ?', (profile,))
+            learned_dict = {row[0]: row[1] for row in cursor.fetchall()}
+            
             mock_cases = []
             for i, (t_type, def_cmd) in enumerate(templates.items(), 1):
-                learned = self.get_learned_command(profile, t_type)
+                learned = learned_dict.get(t_type)
                 template = learned if learned else def_cmd
                 
                 cmd = template.format(
@@ -150,8 +144,6 @@ class DatabaseManager:
                 
             cursor.executemany('INSERT INTO test_cases (target_serial, execution_order, test_type, command, parameters, expected_output) VALUES (?,?,?,?,?,?)', mock_cases)
             conn.commit()
-            
-        conn.close()
 
 class NokiaOLTConnector:
     """
@@ -203,19 +195,40 @@ class NokiaOLTConnector:
                 return [{"chanpair": "unknown", "serial": s} for s in set(serials)]
         return []
 
-    def _cleanup_failed_provisioning(self, port_full: str):
-        logging.warning(f"Executing Rollback/Cleanup to delete ONT on {port_full}...")
-        self.send_command(f"configure equipment ont interface {port_full} admin-state down", timeout=5)
-        time.sleep(2)
+    def _get_safe_find_cmd(self, db: DatabaseManager) -> str:
+        find_cmd = db.get_learned_command(self.olt_profile, "Find_Provisioned") or "show equipment ont status"
+        if re.search(r'\d+/\d+/\d+', find_cmd) or "ng2:" in find_cmd:
+            logging.warning("Hardcoded port/channel detected in Find command. Resetting to global search.")
+            find_cmd = "show equipment ont status"
+            db.save_learned_command(self.olt_profile, "Find_Provisioned", find_cmd)
+        return find_cmd
+
+    def _get_safe_delete_cmd(self, db: DatabaseManager) -> str:
+        del_cmd_temp = db.get_learned_command(self.olt_profile, "Delete_Provisioned")
+        default_cmd = "configure equipment ont interface {port} admin-state down ; configure equipment ont no interface {port}"
+        if not del_cmd_temp or "{port}" not in del_cmd_temp:
+            logging.warning("Hardcoded or invalid deletion command detected in database. Resetting to default template with {port}.")
+            db.save_learned_command(self.olt_profile, "Delete_Provisioned", default_cmd)
+            return default_cmd
+        return del_cmd_temp
+
+    def _delete_ont_by_port(self, port_full: str, db: DatabaseManager):
+        logging.info(f"Aggressively deleting ONT bound to port: {port_full}...")
+        del_cmd_temp = self._get_safe_delete_cmd(db)
         
-        db = DatabaseManager()
-        del_cmd_temp = db.get_learned_command(self.olt_profile, "Delete_Provisioned") or f"configure equipment ont no interface {port_full}"
         cmds = [c.strip() for c in del_cmd_temp.split(';') if c.strip()]
         for c in cmds:
-            self.send_command(c.format(port=port_full), timeout=5)
+            exec_cmd = c.format(port=port_full)
+            logging.info(f"Executing Cleanup Command: {exec_cmd}")
+            self.send_command(exec_cmd, timeout=5)
             
-        time.sleep(1)
-        logging.info("Rollback complete. ONT deleted and ready for a fresh start.")
+        time.sleep(2)
+        logging.info(f"Cleanup complete for port {port_full}.")
+
+    def _cleanup_failed_provisioning(self, port_full: str):
+        logging.warning(f"Executing Rollback/Cleanup on target port {port_full} due to failure...")
+        db = DatabaseManager()
+        self._delete_ont_by_port(port_full, db)
 
     def format_serial(self, serial_raw: str) -> str:
         vendor_id = serial_raw[:4]
@@ -249,6 +262,9 @@ class NokiaOLTConnector:
 
         logging.info(f"--- [STEP 1] Initiating ONT Registration for {serial_raw} on {port_full} ---")
         
+        # [CRITICAL FIX] Stricter error keywords so "invalid" in tables doesn't trigger false errors
+        error_kws = ["invalid command", "invalid token", "unknown command", "bad parameter", "incomplete command"]
+        
         while True:
             success = True
             for template in cmd_templates:
@@ -260,7 +276,8 @@ class NokiaOLTConnector:
                 out = self.send_command(cmd, timeout=10)
                 logging.info(f"Reg Cmd: {cmd} \nOutput: {out.strip()}")
                 
-                if (any(kw in out.lower() for kw in ["invalid", "error", "unknown command"]) or "^" in out) and "pattern not detected" not in out.lower():
+                out_lower = out.lower()
+                if (any(kw in out_lower for kw in error_kws) or "^" in out) and "pattern not detected" not in out_lower:
                     print(f"\n[ REGISTRATION FAILED ] Command rejected: {cmd}")
                     self._cleanup_failed_provisioning(port_full)
                     
@@ -283,7 +300,13 @@ class NokiaOLTConnector:
         chanpair = config.get('chanpair', '')
         serial_formatted = self.format_serial(config['ont_serial'])
 
-        cmd_template = db.get_learned_command(self.olt_profile, "Reg_Verify_Cmd") or "show equipment ont status channel-pair {chanpair}"
+        cmd_template = db.get_learned_command(self.olt_profile, "Reg_Verify_Cmd")
+        default_verify_cmd = "show equipment ont status channel-pair {chanpair}"
+        
+        if not cmd_template or ("{chanpair}" not in cmd_template and "{port}" not in cmd_template):
+            logging.warning("Hardcoded or invalid Verification command detected. Resetting to default dynamic template.")
+            db.save_learned_command(self.olt_profile, "Reg_Verify_Cmd", default_verify_cmd)
+            cmd_template = default_verify_cmd
 
         logging.info(f"--- [STEP 2] Verifying ONT Registration on {port_full} ---")
 
@@ -296,7 +319,7 @@ class NokiaOLTConnector:
             for attempt in range(1, max_retries + 1):
                 last_out = self.send_command(cmd, timeout=5)
                 
-                match_line = [line for line in last_out.split('\n') if serial_formatted.lower() in line.lower()]
+                match_line = [line for line in last_out.split('\n') if serial_formatted.lower() in line.lower() and port_full.lower() in line.lower()]
                 
                 if match_line:
                     line_text = match_line[0].strip()
@@ -305,20 +328,20 @@ class NokiaOLTConnector:
                     logging.info(f"Polling (Attempt {attempt}/{max_retries}) - Found Data Row: '{line_text}'")
                     
                     if "up" in tokens:
-                        logging.info("[SUCCESS] Oper status is UP. ONT is physically registered.")
+                        logging.info("[SUCCESS] Oper status is UP. ONT is physically registered to the correct port.")
                         success = True
                         break
                     else:
                         logging.info(f"Polling (Attempt {attempt}/{max_retries}) - ONT found but oper status is not UP yet.")
                 else:
-                    logging.info(f"Polling (Attempt {attempt}/{max_retries}) - Waiting for ONT data row to appear...")
+                    logging.info(f"Polling (Attempt {attempt}/{max_retries}) - Waiting for ONT on port {port_full} to appear...")
                     
                 time.sleep(5)
                 
             if success:
                 return True
                 
-            print(f"\n[ VERIFICATION TIMEOUT ] Could not find oper status 'UP' for serial {serial_formatted}.")
+            print(f"\n[ VERIFICATION TIMEOUT ] Could not find oper status 'UP' for serial {serial_formatted} on port {port_full}.")
             print(f"Last Output of '{cmd}':\n{last_out}")
             print("\n[ RECOVERY ACTION ]")
             print("  [1] Retry polling (+25s)")
@@ -342,7 +365,6 @@ class NokiaOLTConnector:
 
     def provision_service_ont(self, config: Dict, db: DatabaseManager) -> bool:
         port_full = f"{config['pon']}/{config['ont_id']}"
-        
         prov_key = f"Provisioning_Service_{config['ont_type'].upper()}"
         learned_cmds = db.get_learned_command(self.olt_profile, prov_key)
         
@@ -365,6 +387,7 @@ class NokiaOLTConnector:
                 ]
 
         logging.info(f"--- [STEP 3] Initiating Service Provisioning on {port_full} ---")
+        error_kws = ["invalid command", "invalid token", "unknown command", "bad parameter", "incomplete command"]
         
         while True:
             success = True
@@ -377,7 +400,8 @@ class NokiaOLTConnector:
                 out = self.send_command(cmd, timeout=10)
                 logging.info(f"Prov Cmd: {cmd} \nOutput: {out.strip()}")
                 
-                if (any(kw in out.lower() for kw in ["invalid", "error", "unknown command"]) or "^" in out) and "pattern not detected" not in out.lower():
+                out_lower = out.lower()
+                if (any(kw in out_lower for kw in error_kws) or "^" in out) and "pattern not detected" not in out_lower:
                     print(f"\n[ SERVICE PROVISIONING FAILED ] Command rejected: {cmd}")
                     self._cleanup_failed_provisioning(port_full)
                     
@@ -417,47 +441,49 @@ class TestAutomationEngine:
                 logging.info(f"Waiting {sn['parameters']['wait']} seconds...")
                 time.sleep(sn['parameters']['wait'])
             
-            if sn['type'] == "STC_Traffic_Test":
-                logging.info(f"Preparing external STC script: {sn['command']}")
+            if sn['type'] == "Speed_Test":
+                logging.info(f"Preparing Speed Test script: {sn['command']}")
                 if os.path.exists(sn['command']):
                     try:
                         cmd_args = [
                             sys.executable, sn['command'],
-                            "--chassis", config.get('stc_chassis', '10.10.10.10'),
-                            "--tx_port", config.get('stc_tx_port', '1/1'),
-                            "--rx_port", config.get('stc_rx_port', '1/2'),
-                            "--vlan", config.get('vlan_id', '1001'),
-                            "--framesize", str(config.get('stc_frame_size', 1518)),
-                            "--load", str(config.get('stc_load', 10)),
-                            "--duration", str(config.get('stc_duration', 10))
+                            "--duration", str(config.get('speed_duration', 10)),
+                            "--pass_criteria", str(config.get('speed_pass_mbps', 500))
                         ]
+                        
+                        iperf_server = config.get('iperf_server', '').strip()
+                        if iperf_server:
+                            cmd_args.extend(["--iperf_server", iperf_server])
+                            cmd_args.extend(["--iperf_port", str(config.get('iperf_port', 5201))])
+                            
+                        ost_server = config.get('ost_server', '').strip()
+                        if ost_server:
+                            cmd_args.extend(["--ost_server", ost_server])
+
                         logging.info(f"Running Command: {' '.join(cmd_args)}")
                         
-                        stc_duration = int(config.get('stc_duration', 10))
-                        proc_timeout = stc_duration + 120 
+                        test_duration = int(config.get('speed_duration', 10))
+                        proc_timeout = (test_duration * 2) + 30 
                         
                         process = subprocess.run(cmd_args, capture_output=True, text=True, timeout=proc_timeout)
                         res = process.stdout + "\n" + process.stderr
                         
-                        # Empty output validation logic
                         if not res.strip():
-                            err_msg = "ERROR: stc_test.py produced NO OUTPUT. The file might be empty or improperly saved."
+                            err_msg = "ERROR: speed_test.py produced NO OUTPUT."
                             print(err_msg)
-                            res += f"\n{err_msg}\n[STC_EXECUTION_FAILED]"
-                            logging.error("STC Script Executed but returned empty string.")
+                            res += f"\n{err_msg}\n[SPEED_TEST_FAILED]"
+                            logging.error("Speed Test Script Executed but returned empty string.")
                         else:
                             print("\n" + "="*60)
-                            print(f" [ STC TRAFFIC TEST RESULTS (Duration: {stc_duration}s) ] ")
+                            print(f" [ REAL NETWORK SPEED TEST RESULTS ] ")
                             print("="*60)
                             print(res.strip())
                             print("="*60 + "\n")
                             
-                            if process.returncode == 0 and "ERROR" not in res and "CRITICAL" not in res:
-                                res += "\n[STC_EXECUTION_SUCCESS]"
-                                logging.info("STC script executed successfully.")
+                            if process.returncode == 0 and "SPEED_TEST_SUCCESS" in res:
+                                logging.info("Speed test executed successfully.")
                             else:
-                                logging.error(f"STC Script Failed with return code {process.returncode}")
-                                res += "\n[STC_EXECUTION_FAILED]"
+                                logging.error(f"Speed Test Script Failed with return code {process.returncode}")
                                 
                     except subprocess.TimeoutExpired:
                         res = f"Script execution timed out after {proc_timeout} seconds."
@@ -467,9 +493,9 @@ class TestAutomationEngine:
                         logging.error(res)
                 else:
                     logging.warning(f"Script '{sn['command']}' not found in the current directory.")
-                    logging.info("Simulating STC Bypass (Pass) to continue the pipeline...")
+                    logging.info("Simulating Test Bypass (Pass) to continue the pipeline...")
                     time.sleep(2)
-                    res = "[STC_EXECUTION_SUCCESS]"
+                    res = "[SPEED_TEST_SUCCESS]"
             else:
                 res = self.olt.send_command(sn['command'])
             
@@ -492,14 +518,20 @@ class TestAutomationEngine:
         return True
 
     def _verify(self, t_type: str, res: str) -> bool:
-        if not res or any(x in res.lower() for x in ["invalid", "error", "unknown command", "^"]): return False
+        if not res: return False
         res_lower = res.lower()
+        
+        # [CRITICAL FIX] Only catch actual syntax/command rejections, NOT table values like 'invalid'
+        error_kws = ["invalid command", "invalid token", "unknown command", "bad parameter", "incomplete command"]
+        if any(kw in res_lower for kw in error_kws) or "^" in res: 
+            return False
         
         if t_type == "OLT_Version_Check": 
             return len(res.strip()) > 0 
             
         if t_type == "Ranging_Test":
-            if "pref-ranged" in res_lower and self.serial_formatted.lower() in res_lower:
+            serial_clean = self.serial.replace(":", "").lower()
+            if "pref-ranged" in res_lower and serial_clean in res_lower.replace(":", ""):
                 return True
             return False
             
@@ -509,8 +541,8 @@ class TestAutomationEngine:
         if t_type == "MAC_Status": 
             return bool(re.search(r'([0-9A-F]{2}:){5}[0-9A-F]{2}', res, re.I))
             
-        if t_type == "STC_Traffic_Test":
-            return "[STC_EXECUTION_SUCCESS]" in res or "success" in res_lower
+        if t_type == "Speed_Test":
+            return "[SPEED_TEST_SUCCESS]" in res
 
         return True
 
@@ -519,9 +551,10 @@ class TestAutomationEngine:
         print(f"Command executed: {sn['command']}\nOutput received:\n{res}\n")
         
         res_lower = res.lower()
-        is_syntax_error = any(kw in res_lower for kw in ["invalid", "error", "unknown", "incomplete", "bad parameter"]) or "^" in res
+        error_kws = ["invalid command", "invalid token", "unknown command", "bad parameter", "incomplete command"]
+        is_syntax_error = any(kw in res_lower for kw in error_kws) or "^" in res
         
-        if is_syntax_error and sn['type'] != "STC_Traffic_Test":
+        if is_syntax_error and sn['type'] != "Speed_Test":
             print(f"\n[ AI Auto-Detection ] 'Invalid CLI' detected.")
             while True:
                 tmp = input(f"Please enter the correct CLI template for {sn['type']} (or type 'exit'): ").strip()
@@ -612,6 +645,11 @@ if __name__ == "__main__":
             if not onts_list:
                 print("No unprovisioned ONTs available to select.")
                 continue
+                
+            print("\n[ Available Unprovisioned ONTs ]")
+            for i, item in enumerate(onts_list, 1): 
+                print(f"  [{i}] Serial: {item['serial']} | ChanPair: {item['chanpair']}")
+                
             sel = 0
             while True:
                 sel_input = input("\nSelect Index: ").strip()
@@ -630,7 +668,7 @@ if __name__ == "__main__":
             break
             
         elif choice == "2":
-            find_cmd = db.get_learned_command(olt.olt_profile, "Find_Provisioned") or "show equipment ont status"
+            find_cmd = olt._get_safe_find_cmd(db)
             print(f"\nCurrent command to find provisioned ONTs: {find_cmd}")
             chg = input("Press Enter to use this, or type a new command: ").strip()
             if chg:
@@ -640,26 +678,40 @@ if __name__ == "__main__":
             out = olt.send_command(find_cmd)
             print(f"\n[ PROVISIONED ONTs OUTPUT ]\n{out}\n")
             
-            del_port = input("Enter the PORT of the ONT to delete (e.g., ng2:5/1/10) or 'cancel': ").strip()
-            if del_port.lower() == 'cancel' or not del_port: continue
-                
-            del_cmd_temp = db.get_learned_command(olt.olt_profile, "Delete_Provisioned") or "configure equipment ont interface {port} admin-state down ; configure equipment ont no interface {port}"
+            del_target = input("Enter PORT or SERIAL to delete (e.g., ng2:5/1/10 or HUMA23084463) or 'cancel': ").strip()
+            if del_target.lower() == 'cancel' or not del_target: continue
+            
+            target_port = del_target
+            if '/' not in del_target and ':' not in del_target:
+                matches = re.findall(r'(\d+(?:/\d+)+)\s+([a-zA-Z0-9:-]+(?:/\d+)+)\s+([A-Za-z]{4}:?[A-Fa-f0-9]{8})', out)
+                found = False
+                for m in matches:
+                    if del_target.lower() in m[2].lower().replace(':', ''):
+                        target_port = m[1]
+                        found = True
+                        print(f"-> Found Serial {m[2]} residing on Port {target_port}.")
+                        break
+                if not found:
+                    print("-> Could not find that Serial in the provisioned list.")
+                    continue
+                    
+            del_cmd_temp = olt._get_safe_delete_cmd(db)
             chg_del = input(f"Press Enter to use current Deletion Template, or type a new one:\n[{del_cmd_temp}]\n-> ").strip()
             if chg_del:
-                del_cmd_temp = chg_del
-                db.save_learned_command(olt.olt_profile, "Delete_Provisioned", del_cmd_temp)
+                if "{port}" in chg_del:
+                    del_cmd_temp = chg_del
+                    db.save_learned_command(olt.olt_profile, "Delete_Provisioned", del_cmd_temp)
+                else:
+                    print("\nWARNING: The template you entered DOES NOT contain '{port}'.")
+                    print("This will cause errors! Falling back to the safe template.")
                 
-            cmds = [c.strip() for c in del_cmd_temp.split(';') if c.strip()]
-            for c in cmds:
-                res = olt.send_command(c.format(port=del_port))
-                logging.info(f"Output: {res.strip()}")
-                
-            logging.info("Deletion complete. Returning to Discovery Menu...")
+            olt._delete_ont_by_port(target_port, db)
+            logging.info("Returning to Discovery Menu...")
             time.sleep(2)
             continue
             
         elif choice == "3":
-            find_cmd = db.get_learned_command(olt.olt_profile, "Find_Provisioned") or "show equipment ont status"
+            find_cmd = olt._get_safe_find_cmd(db)
             out = olt.send_command(find_cmd)
             print(f"\n[ PROVISIONED ONTs OUTPUT ]\n{out}\n")
             
@@ -697,7 +749,26 @@ if __name__ == "__main__":
         else:
             print("Invalid option selected.")
 
+    port_full = f"{config['pon']}/{config['ont_id']}"
+
     if not skip_provisioning:
+        find_cmd = olt._get_safe_find_cmd(db)
+        out = olt.send_command(find_cmd)
+        matches = re.findall(r'(\d+(?:/\d+)+)\s+([a-zA-Z0-9:-]+(?:/\d+)+)\s+([A-Za-z]{4}:?[A-Fa-f0-9]{8})', out)
+        for m in matches:
+            if config['ont_serial'].lower() in m[2].lower().replace(':', ''):
+                existing_port = m[1]
+                if existing_port != port_full:
+                    logging.warning(f"ONT {config['ont_serial']} is currently registered on a DIFFERENT port: {existing_port}")
+                    auto_del = input(f"Do you want to automatically DELETE it from {existing_port} before proceeding? (y/n) [default: y]: ").strip().lower()
+                    if auto_del != 'n':
+                        olt._delete_ont_by_port(existing_port, db)
+                        time.sleep(3)
+                    else:
+                        logging.error("Cannot provision because the ONT is bound to another port. Aborting.")
+                        sys.exit(1)
+                break
+
         print("\n" + "-"*40)
         print("  ONT Configuration Setup")
         print("-" * 40)
@@ -725,21 +796,20 @@ if __name__ == "__main__":
             print(f"  -> Traffic Generator selected. Auto-assigning VLAN ID: {config['vlan_id']}")
 
     print("\n" + "-"*40)
-    print("  STC Traffic Generator Setup")
+    print("  Real Network Speed Test Setup")
     print("-" * 40)
-    stc_setup = input("Would you like to configure STC Test parameters? (y/n) [default: y]: ").strip().lower()
-    if stc_setup != 'n':
-        config['stc_chassis'] = input(f"STC Chassis IP [{config.get('stc_chassis', '10.10.10.10')}]: ").strip() or config.get('stc_chassis', '10.10.10.10')
-        config['stc_tx_port'] = input(f"STC TX Port (e.g., 1/1) [{config.get('stc_tx_port', '1/1')}]: ").strip() or config.get('stc_tx_port', '1/1')
-        config['stc_rx_port'] = input(f"STC RX Port (e.g., 1/2) [{config.get('stc_rx_port', '1/2')}]: ").strip() or config.get('stc_rx_port', '1/2')
-        config['stc_frame_size'] = input(f"Frame Size in bytes [{config.get('stc_frame_size', '1518')}]: ").strip() or config.get('stc_frame_size', '1518')
-        config['stc_load'] = input(f"Traffic Load % [{config.get('stc_load', '10')}]: ").strip() or config.get('stc_load', '10')
-        config['stc_duration'] = input(f"Test Duration in sec [{config.get('stc_duration', '10')}]: ").strip() or config.get('stc_duration', '10')
+    speed_setup = input("Would you like to configure Speed Test parameters? (y/n) [default: y]: ").strip().lower()
+    if speed_setup != 'n':
+        print("Note: Leave IP/URL blank to skip that specific test.")
+        config['iperf_server'] = input(f"iperf3 Server IP [{config.get('iperf_server', '')}]: ").strip() or config.get('iperf_server', '')
+        config['iperf_port'] = input(f"iperf3 Server Port [{config.get('iperf_port', '5201')}]: ").strip() or config.get('iperf_port', '5201')
+        config['ost_server'] = input(f"OpenSpeedTest Server URL (e.g. http://192.168.1.100:3000) [{config.get('ost_server', '')}]: ").strip() or config.get('ost_server', '')
+        config['speed_duration'] = input(f"Test Duration per test in sec [{config.get('speed_duration', '10')}]: ").strip() or config.get('speed_duration', '10')
+        config['speed_pass_mbps'] = input(f"Pass Criteria (Mbps) [{config.get('speed_pass_mbps', '500')}]: ").strip() or config.get('speed_pass_mbps', '500')
 
     with open(CONFIG_FILE, 'w') as f: json.dump(config, f, indent=4)
 
     db.add_initial_test_cases(config, olt.olt_profile)
-    port_full = f"{config['pon']}/{config['ont_id']}"
 
     if not skip_provisioning:
         while True:
