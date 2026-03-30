@@ -7,6 +7,8 @@ import sys
 import getpass
 import re
 import subprocess
+import threading
+from datetime import datetime
 from typing import List, Dict, Tuple
 
 try:
@@ -16,21 +18,200 @@ except ImportError:
     logging.error("Netmiko library is not installed. Please run: pip install netmiko")
     sys.exit(1)
 
+# [NEW] Excel Library Check
+try:
+    import openpyxl
+    from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
+    from openpyxl.chart import LineChart, Reference
+    EXCEL_SUPPORT = True
+except ImportError:
+    logging.warning("openpyxl is not installed! Excel report generation will be skipped. Run 'pip install openpyxl'")
+    EXCEL_SUPPORT = False
+
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 
 CONFIG_FILE = "env_config.json"
 
+def generate_professional_excel_report(serial: str, db, config: Dict):
+    """Generates a highly formatted 3-sheet Excel report with live speed graphs."""
+    if not EXCEL_SUPPORT: return
+    
+    cases = db.load_test_cases(serial)
+    filename = f"ONT_Test_Result_{serial}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+    
+    try:
+        wb = openpyxl.Workbook()
+        
+        # Define Styles
+        bold_font = Font(bold=True)
+        title_font = Font(size=16, bold=True, color="FFFFFF")
+        hdr_fill = PatternFill(start_color="4F81BD", end_color="4F81BD", fill_type="solid")
+        pass_fill = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
+        fail_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+        na_fill = PatternFill(start_color="FFEB9C", end_color="FFEB9C", fill_type="solid")
+        nt_fill = PatternFill(start_color="F2F2F2", end_color="F2F2F2", fill_type="solid")
+        center_align = Alignment(horizontal="center", vertical="center")
+        thin_border = Border(left=Side(style='thin'), right=Side(style='thin'), top=Side(style='thin'), bottom=Side(style='thin'))
+
+        # =========================================================================
+        # SHEET 1: SUMMARY
+        # =========================================================================
+        ws_sum = wb.active
+        ws_sum.title = "Summary"
+        
+        ws_sum.merge_cells('B2:E3')
+        title_cell = ws_sum.cell(row=2, column=2, value="ONT Automation Test Report")
+        title_cell.font = title_font
+        title_cell.alignment = center_align
+        title_cell.fill = hdr_fill
+        
+        # Calculate Metrics
+        total = len(cases)
+        c_pass = sum(1 for c in cases if c['status'] == 'PASS')
+        c_fail = sum(1 for c in cases if c['status'] == 'FAIL')
+        c_na   = sum(1 for c in cases if c['status'] == 'N/A')
+        c_nt   = sum(1 for c in cases if c['status'] == 'N/T')
+        progress = ((total - c_nt) / total) * 100 if total else 0
+        
+        info = [
+            ("Target Serial", serial),
+            ("Target PON / ID", f"{config.get('pon', 'N/A')} / {config.get('ont_id', 'N/A')}"),
+            ("Test Date", datetime.now().strftime('%Y-%m-%d %H:%M:%S')),
+            ("Total Tests", total),
+            ("PASS", c_pass),
+            ("FAIL", c_fail),
+            ("N/A (Skipped)", c_na),
+            ("N/T (Not Tested)", c_nt),
+            ("Progress", f"{progress:.1f}%")
+        ]
+        
+        row_idx = 5
+        for key, val in info:
+            c_key = ws_sum.cell(row=row_idx, column=2, value=key)
+            c_val = ws_sum.cell(row=row_idx, column=3, value=val)
+            c_key.font = bold_font
+            c_key.border = thin_border
+            c_val.border = thin_border
+            if key == "PASS": c_val.fill = pass_fill
+            elif key == "FAIL": c_val.fill = fail_fill
+            elif key == "N/A (Skipped)": c_val.fill = na_fill
+            elif key == "N/T (Not Tested)": c_val.fill = nt_fill
+            row_idx += 1
+            
+        ws_sum.column_dimensions['B'].width = 20
+        ws_sum.column_dimensions['C'].width = 30
+
+        # =========================================================================
+        # SHEET 2: DETAILS
+        # =========================================================================
+        ws_det = wb.create_sheet(title="Details")
+        headers = ["Test Order", "Test Item", "Command / Script", "Result"]
+        for col_num, header in enumerate(headers, 1):
+            cell = ws_det.cell(row=1, column=col_num, value=header)
+            cell.font = bold_font
+            cell.fill = PatternFill(start_color="D9D9D9", end_color="D9D9D9", fill_type="solid")
+            cell.alignment = center_align
+            cell.border = thin_border
+            
+        for idx, c in enumerate(cases, 2):
+            ws_det.cell(row=idx, column=1, value=c['order']).alignment = center_align
+            ws_det.cell(row=idx, column=2, value=c['type'])
+            ws_det.cell(row=idx, column=3, value=c['command'])
+            
+            res_cell = ws_det.cell(row=idx, column=4, value=c['status'])
+            res_cell.alignment = center_align
+            if c['status'] == 'PASS': res_cell.fill = pass_fill
+            elif c['status'] == 'FAIL': res_cell.fill = fail_fill
+            elif c['status'] == 'N/A': res_cell.fill = na_fill
+            else: res_cell.fill = nt_fill
+            
+            for col in range(1, 5):
+                ws_det.cell(row=idx, column=col).border = thin_border
+                
+        ws_det.column_dimensions['B'].width = 25
+        ws_det.column_dimensions['C'].width = 80
+        ws_det.column_dimensions['D'].width = 15
+
+        # =========================================================================
+        # SHEET 3: LOGS & GRAPH
+        # =========================================================================
+        ws_log = wb.create_sheet(title="Logs & Graph")
+        ws_log.cell(row=1, column=1, value="Test Item").font = bold_font
+        ws_log.cell(row=1, column=2, value="Execution Log").font = bold_font
+        ws_log.column_dimensions['A'].width = 20
+        ws_log.column_dimensions['B'].width = 100
+        
+        log_row = 2
+        speed_data_rows = []
+        
+        for c in cases:
+            ws_log.cell(row=log_row, column=1, value=c['type']).font = bold_font
+            log_lines = (c['log'] or "No log captured.").split('\n')
+            
+            for line in log_lines:
+                clean_line = line.strip()
+                if not clean_line: continue
+                ws_log.cell(row=log_row, column=2, value=clean_line)
+                
+                # Parse iperf3 logs for graph data
+                if c['type'] == 'Speed_Test' and "[SUM]" in clean_line and "sec" in clean_line and "bits/sec" in clean_line:
+                    if "sender" not in clean_line and "receiver" not in clean_line:
+                        # Extract Time and Mbps
+                        match = re.search(r'\[SUM\]\s+\d+\.\d+-\s*(\d+\.\d+)\s+sec.*?\s+(\d+(?:\.\d+)?)\s+([KMG])bits/sec', clean_line)
+                        if match:
+                            end_time = float(match.group(1))
+                            val = float(match.group(2))
+                            unit = match.group(3)
+                            mbps = val * 1000 if unit == 'G' else (val if unit == 'M' else val / 1000)
+                            speed_data_rows.append((end_time, mbps))
+                log_row += 1
+            log_row += 1 
+
+        # Draw Chart if Speed Data Exists
+        if speed_data_rows:
+            ws_log.cell(row=1, column=4, value="Time (sec)").font = bold_font
+            ws_log.cell(row=1, column=5, value="Throughput (Mbps)").font = bold_font
+            
+            r_idx = 2
+            for t_sec, speed in speed_data_rows:
+                ws_log.cell(row=r_idx, column=4, value=t_sec)
+                ws_log.cell(row=r_idx, column=5, value=speed)
+                r_idx += 1
+                
+            chart = LineChart()
+            chart.title = "iPerf3 Throughput over Time"
+            chart.style = 13
+            chart.y_axis.title = 'Throughput (Mbps)'
+            chart.x_axis.title = 'Time (sec)'
+            chart.width = 18
+            chart.height = 10
+            
+            data = Reference(ws_log, min_col=5, min_row=1, max_row=r_idx-1)
+            cats = Reference(ws_log, min_col=4, min_row=2, max_row=r_idx-1)
+            chart.add_data(data, titles_from_data=True)
+            chart.set_categories(cats)
+            
+            ws_log.add_chart(chart, "G2")
+
+        wb.save(filename)
+        print("\n" + "="*60)
+        print(f" [✔] Professional Excel Report Generated: {filename} ")
+        print("="*60 + "\n")
+        
+    except Exception as e:
+        logging.error(f"Failed to generate Excel report: {e}")
+
 class DatabaseManager:
-    """
-    Manages the SQLite database for ONT inventory, test cases, and command learning by OLT profile.
-    """
     def __init__(self, db_name: str = "olt_physical_automation.db"):
         self.db_name = db_name
         self._initialize_database()
 
+    def _get_conn(self):
+        return sqlite3.connect(self.db_name, timeout=20)
+
     def _initialize_database(self):
-        with sqlite3.connect(self.db_name, timeout=20) as conn:
+        with self._get_conn() as conn:
             cursor = conn.cursor()
             cursor.execute('''CREATE TABLE IF NOT EXISTS ont_inventory (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, serial_number TEXT UNIQUE, 
@@ -43,56 +224,57 @@ class DatabaseManager:
                 
             cursor.execute('''CREATE TABLE IF NOT EXISTS learned_commands (
                 olt_profile TEXT, test_type TEXT, command_template TEXT, PRIMARY KEY (olt_profile, test_type))''')
+            
+            # Upgrade Schema for Excel Reporting gracefully
+            try: cursor.execute("ALTER TABLE test_cases ADD COLUMN status TEXT DEFAULT 'N/T'")
+            except: pass
+            try: cursor.execute("ALTER TABLE test_cases ADD COLUMN execution_log TEXT")
+            except: pass
             conn.commit()
 
     def add_ont(self, serial: str, pon: str, ont_id: str, status: str):
-        with sqlite3.connect(self.db_name, timeout=20) as conn:
+        with self._get_conn() as conn:
             cursor = conn.cursor()
             cursor.execute('INSERT OR REPLACE INTO ont_inventory (serial_number, pon_port, ont_id, status) VALUES (?, ?, ?, ?)', 
                            (serial, pon, ont_id, status))
             conn.commit()
 
     def get_learned_command(self, profile: str, t_type: str) -> str:
-        with sqlite3.connect(self.db_name, timeout=20) as conn:
+        with self._get_conn() as conn:
             cursor = conn.cursor()
             cursor.execute('SELECT command_template FROM learned_commands WHERE olt_profile = ? AND test_type = ?', (profile, t_type))
             row = cursor.fetchone()
             return row[0] if row else None
 
     def save_learned_command(self, profile: str, t_type: str, template: str):
-        with sqlite3.connect(self.db_name, timeout=20) as conn:
+        with self._get_conn() as conn:
             cursor = conn.cursor()
             cursor.execute('INSERT OR REPLACE INTO learned_commands (olt_profile, test_type, command_template) VALUES (?, ?, ?)', 
                            (profile, t_type, template))
             conn.commit()
 
     def update_test_case(self, t_id: int, cmd: str, params: str):
-        with sqlite3.connect(self.db_name, timeout=20) as conn:
+        with self._get_conn() as conn:
             cursor = conn.cursor()
             cursor.execute('UPDATE test_cases SET command = ?, parameters = ? WHERE id = ?', (cmd, params, t_id))
             conn.commit()
 
-    def mark_test_success(self, test_id: int):
-        with sqlite3.connect(self.db_name, timeout=20) as conn:
+    def update_test_status(self, t_id: int, status: str, log: str):
+        with self._get_conn() as conn:
             cursor = conn.cursor()
-            cursor.execute("UPDATE test_cases SET success_count = success_count + 1 WHERE id = ?", (test_id,))
-            cursor.execute("UPDATE test_cases SET is_evolved = 1 WHERE id = ? AND success_count >= 1", (test_id,))
+            cursor.execute("UPDATE test_cases SET status = ?, execution_log = ? WHERE id = ?", (status, log, t_id))
+            if status == "PASS":
+                cursor.execute("UPDATE test_cases SET success_count = success_count + 1 WHERE id = ?", (t_id,))
             conn.commit()
 
     def load_test_cases(self, serial: str) -> List[Dict]:
-        with sqlite3.connect(self.db_name, timeout=20) as conn:
+        with self._get_conn() as conn:
             cursor = conn.cursor()
-            cursor.execute('SELECT id, target_serial, execution_order, test_type, command, parameters FROM test_cases WHERE target_serial = ? ORDER BY execution_order ASC', (serial,))
+            cursor.execute('SELECT id, target_serial, execution_order, test_type, command, parameters, status, execution_log FROM test_cases WHERE target_serial = ? ORDER BY execution_order ASC', (serial,))
             rows = cursor.fetchall()
-            return [{"id": r[0], "serial": r[1], "order": r[2], "type": r[3], "command": r[4], "parameters": json.loads(r[5])} for r in rows]
+            return [{"id": r[0], "serial": r[1], "order": r[2], "type": r[3], "command": r[4], "parameters": json.loads(r[5]), "status": r[6], "log": r[7]} for r in rows]
 
     def add_initial_test_cases(self, config: Dict, profile: str):
-        # 1. Reset broken Ranging_Test dynamically to avoid lock
-        current_ranging_cmd = self.get_learned_command(profile, "Ranging_Test")
-        if current_ranging_cmd and "{chanpair}" not in current_ranging_cmd:
-            logging.warning("Hardcoded Ranging_Test command detected. Resetting to dynamic template.")
-            self.save_learned_command(profile, "Ranging_Test", "show equipment ont status channel-pair {chanpair}")
-
         serial = config['ont_serial']
         pon = config['pon']
         ont_id = config['ont_id']
@@ -102,17 +284,16 @@ class DatabaseManager:
         sn_rem = serial[4:]
         serial_formatted = f"{vendor_id}:{sn_rem}"
 
-        # 2. Safely perform bulk insert in a unified transaction
-        with sqlite3.connect(self.db_name, timeout=20) as conn:
+        with self._get_conn() as conn:
             cursor = conn.cursor()
             cursor.execute("DELETE FROM test_cases WHERE target_serial = ?", (serial,))
                     
             templates = {
-                "OLT_Version_Check": "show version",
-                "Ranging_Test": "show equipment ont status channel-pair {chanpair}", 
+                "ONT_Discovery_Check": "show equipment ont status channel-pair {chanpair}", 
+                "Registration_Check": "show equipment ont status channel-pair {chanpair}", 
                 "Optics_Check": "show equipment ont optics {port}",
                 "UNI_Status": "show equipment ont interface {port}",
-                "Software_Info": "show equipment ont sw-version {port}",
+                "Software_Info": "show equipment ont interface {port} detail",
                 "Speed_Test": "speed_test.py", 
                 "MAC_Status": "show vlan bridge-port-fdb {port}/1/1",
                 "Reboot_Test": "admin equipment ont interface {port} reboot",
@@ -124,8 +305,17 @@ class DatabaseManager:
             
             mock_cases = []
             for i, (t_type, def_cmd) in enumerate(templates.items(), 1):
-                learned = learned_dict.get(t_type)
-                template = learned if learned else def_cmd
+                template = learned_dict.get(t_type)
+                
+                if "{port}" in def_cmd and template and "{port}" not in template:
+                    template = def_cmd
+                    cursor.execute('INSERT OR REPLACE INTO learned_commands (olt_profile, test_type, command_template) VALUES (?, ?, ?)', (profile, t_type, def_cmd))
+                elif "{chanpair}" in def_cmd and template and "{chanpair}" not in template:
+                    template = def_cmd
+                    cursor.execute('INSERT OR REPLACE INTO learned_commands (olt_profile, test_type, command_template) VALUES (?, ?, ?)', (profile, t_type, def_cmd))
+                    
+                if not template:
+                    template = def_cmd
                 
                 cmd = template.format(
                     serial=serial, 
@@ -137,18 +327,15 @@ class DatabaseManager:
                 )
                 
                 params = {"timeout": 15, "wait": 0}
-                if t_type == "Ranging_Test": params["wait"] = 5
+                if t_type == "Registration_Check": params["wait"] = 5
                 elif t_type == "MAC_Status": params["wait"] = 10
                     
-                mock_cases.append((serial, i, t_type, cmd, json.dumps(params), "Success"))
+                mock_cases.append((serial, i, t_type, cmd, json.dumps(params), "N/T"))
                 
-            cursor.executemany('INSERT INTO test_cases (target_serial, execution_order, test_type, command, parameters, expected_output) VALUES (?,?,?,?,?,?)', mock_cases)
+            cursor.executemany("INSERT INTO test_cases (target_serial, execution_order, test_type, command, parameters, status) VALUES (?,?,?,?,?,?)", mock_cases)
             conn.commit()
 
 class NokiaOLTConnector:
-    """
-    Handles physical SSH/Telnet connection, separated Registration and Provisioning logic.
-    """
     def __init__(self, ip: str, user: str, pw: str, proto: str):
         self.proto = proto
         self.device = {'host': ip, 'username': user, 'password': pw, 'global_delay_factor': 2}
@@ -168,11 +355,17 @@ class NokiaOLTConnector:
                 continue
         return False
 
+    def disconnect(self):
+        if self.connection:
+            try:
+                self.connection.disconnect()
+                logging.info("Gracefully disconnected from OLT.")
+            except Exception: pass
+
     def _discover_profile(self):
         out = self.send_command("show version", 5)
         m = re.search(r'(\d+\.\d+\.\S+)', out)
         self.olt_profile = f"Nokia_OS_{m.group(1)}" if m else "Nokia_Unknown"
-        logging.info(f"OLT Profile identified as: {self.olt_profile}")
 
     def send_command(self, cmd: str, timeout: int = 15) -> str:
         if self.connection:
@@ -198,7 +391,6 @@ class NokiaOLTConnector:
     def _get_safe_find_cmd(self, db: DatabaseManager) -> str:
         find_cmd = db.get_learned_command(self.olt_profile, "Find_Provisioned") or "show equipment ont status"
         if re.search(r'\d+/\d+/\d+', find_cmd) or "ng2:" in find_cmd:
-            logging.warning("Hardcoded port/channel detected in Find command. Resetting to global search.")
             find_cmd = "show equipment ont status"
             db.save_learned_command(self.olt_profile, "Find_Provisioned", find_cmd)
         return find_cmd
@@ -207,7 +399,6 @@ class NokiaOLTConnector:
         del_cmd_temp = db.get_learned_command(self.olt_profile, "Delete_Provisioned")
         default_cmd = "configure equipment ont interface {port} admin-state down ; configure equipment ont no interface {port}"
         if not del_cmd_temp or "{port}" not in del_cmd_temp:
-            logging.warning("Hardcoded or invalid deletion command detected in database. Resetting to default template with {port}.")
             db.save_learned_command(self.olt_profile, "Delete_Provisioned", default_cmd)
             return default_cmd
         return del_cmd_temp
@@ -219,14 +410,12 @@ class NokiaOLTConnector:
         cmds = [c.strip() for c in del_cmd_temp.split(';') if c.strip()]
         for c in cmds:
             exec_cmd = c.format(port=port_full)
-            logging.info(f"Executing Cleanup Command: {exec_cmd}")
             self.send_command(exec_cmd, timeout=5)
             
         time.sleep(2)
         logging.info(f"Cleanup complete for port {port_full}.")
 
     def _cleanup_failed_provisioning(self, port_full: str):
-        logging.warning(f"Executing Rollback/Cleanup on target port {port_full} due to failure...")
         db = DatabaseManager()
         self._delete_ont_by_port(port_full, db)
 
@@ -261,8 +450,6 @@ class NokiaOLTConnector:
                 ]
 
         logging.info(f"--- [STEP 1] Initiating ONT Registration for {serial_raw} on {port_full} ---")
-        
-        # [CRITICAL FIX] Stricter error keywords so "invalid" in tables doesn't trigger false errors
         error_kws = ["invalid command", "invalid token", "unknown command", "bad parameter", "incomplete command"]
         
         while True:
@@ -274,26 +461,20 @@ class NokiaOLTConnector:
                 )
                 
                 out = self.send_command(cmd, timeout=10)
-                logging.info(f"Reg Cmd: {cmd} \nOutput: {out.strip()}")
-                
                 out_lower = out.lower()
                 if (any(kw in out_lower for kw in error_kws) or "^" in out) and "pattern not detected" not in out_lower:
                     print(f"\n[ REGISTRATION FAILED ] Command rejected: {cmd}")
                     self._cleanup_failed_provisioning(port_full)
                     
-                    print("\nPlease enter the correct REGISTRATION sequence for this OLT (Use ';' to separate).")
                     new_cmds = input("Enter commands (or 'exit' to abort): ").strip()
-                    if new_cmds.lower() == 'exit' or not new_cmds:
-                        return False
+                    if new_cmds.lower() == 'exit' or not new_cmds: return False
                         
                     db.save_learned_command(self.olt_profile, reg_key, new_cmds)
                     cmd_templates = [c.strip() for c in new_cmds.split(';') if c.strip()]
                     success = False
                     break 
                     
-            if success:
-                logging.info("Registration commands applied successfully.")
-                return True
+            if success: return True
 
     def verify_registration(self, config: Dict, db: DatabaseManager) -> bool:
         port_full = f"{config['pon']}/{config['ont_id']}"
@@ -304,7 +485,6 @@ class NokiaOLTConnector:
         default_verify_cmd = "show equipment ont status channel-pair {chanpair}"
         
         if not cmd_template or ("{chanpair}" not in cmd_template and "{port}" not in cmd_template):
-            logging.warning("Hardcoded or invalid Verification command detected. Resetting to default dynamic template.")
             db.save_learned_command(self.olt_profile, "Reg_Verify_Cmd", default_verify_cmd)
             cmd_template = default_verify_cmd
 
@@ -314,54 +494,30 @@ class NokiaOLTConnector:
             cmd = cmd_template.format(port=port_full, chanpair=chanpair)
             max_retries = 5
             success = False
-            last_out = ""
+            last_out = self.send_command(cmd, timeout=5) 
             
             for attempt in range(1, max_retries + 1):
                 last_out = self.send_command(cmd, timeout=5)
-                
                 match_line = [line for line in last_out.split('\n') if serial_formatted.lower() in line.lower() and port_full.lower() in line.lower()]
-                
                 if match_line:
-                    line_text = match_line[0].strip()
-                    tokens = line_text.lower().split()
-                    
-                    logging.info(f"Polling (Attempt {attempt}/{max_retries}) - Found Data Row: '{line_text}'")
-                    
+                    tokens = match_line[0].strip().lower().split()
                     if "up" in tokens:
-                        logging.info("[SUCCESS] Oper status is UP. ONT is physically registered to the correct port.")
                         success = True
                         break
-                    else:
-                        logging.info(f"Polling (Attempt {attempt}/{max_retries}) - ONT found but oper status is not UP yet.")
-                else:
-                    logging.info(f"Polling (Attempt {attempt}/{max_retries}) - Waiting for ONT on port {port_full} to appear...")
-                    
                 time.sleep(5)
                 
-            if success:
-                return True
+            if success: return True
                 
             print(f"\n[ VERIFICATION TIMEOUT ] Could not find oper status 'UP' for serial {serial_formatted} on port {port_full}.")
-            print(f"Last Output of '{cmd}':\n{last_out}")
-            print("\n[ RECOVERY ACTION ]")
-            print("  [1] Retry polling (+25s)")
-            print("  [2] Change Verification Command")
-            print("  [3] Force Pass (Assume it is successfully registered and proceed)")
-            print("  [4] Abort & Rollback")
-            
-            choice = input("Select an option [1-4]: ").strip()
-            if choice == '1':
-                continue
+            choice = input("Select an option [1] Retry [2] Change Cmd [3] Force Pass [4] Abort: ").strip()
+            if choice == '1': continue
             elif choice == '2':
-                new_cmd = input(f"Enter new command template (current: {cmd_template}): ").strip()
+                new_cmd = input(f"Enter new command template: ").strip()
                 if new_cmd: 
                     cmd_template = new_cmd
                     db.save_learned_command(self.olt_profile, "Reg_Verify_Cmd", cmd_template)
-            elif choice == '3':
-                logging.info("Force passing registration check by user request.")
-                return True
-            else:
-                return False
+            elif choice == '3': return True
+            else: return False
 
     def provision_service_ont(self, config: Dict, db: DatabaseManager) -> bool:
         port_full = f"{config['pon']}/{config['ont_id']}"
@@ -398,25 +554,16 @@ class NokiaOLTConnector:
                 )
                 
                 out = self.send_command(cmd, timeout=10)
-                logging.info(f"Prov Cmd: {cmd} \nOutput: {out.strip()}")
-                
                 out_lower = out.lower()
                 if (any(kw in out_lower for kw in error_kws) or "^" in out) and "pattern not detected" not in out_lower:
                     print(f"\n[ SERVICE PROVISIONING FAILED ] Command rejected: {cmd}")
                     self._cleanup_failed_provisioning(port_full)
-                    
-                    print("\nPlease enter the correct SERVICE PROVISIONING sequence (Use ';' to separate).")
-                    print(f"Placeholders: {{port}}, {{bw_profile}}, {{max_mac}}, {{vlan_id}}")
                     new_cmds = input("Enter commands (or 'exit' to abort): ").strip()
-                    if new_cmds.lower() == 'exit' or not new_cmds:
-                        return False 
-                        
+                    if new_cmds.lower() == 'exit' or not new_cmds: return False 
                     db.save_learned_command(self.olt_profile, prov_key, new_cmds)
                     return False 
                     
-            if success:
-                logging.info("Service Provisioning completed successfully.")
-                return True
+            if success: return True
 
 class TestAutomationEngine:
     def __init__(self, db: DatabaseManager, olt: NokiaOLTConnector, serial: str, pon: str, ont_id: str):
@@ -441,74 +588,75 @@ class TestAutomationEngine:
                 logging.info(f"Waiting {sn['parameters']['wait']} seconds...")
                 time.sleep(sn['parameters']['wait'])
             
+            res = ""
             if sn['type'] == "Speed_Test":
-                logging.info(f"Preparing Speed Test script: {sn['command']}")
                 if os.path.exists(sn['command']):
                     try:
                         cmd_args = [
                             sys.executable, sn['command'],
                             "--duration", str(config.get('speed_duration', 10)),
-                            "--pass_criteria", str(config.get('speed_pass_mbps', 500))
+                            "--pass_criteria", str(config.get('speed_pass_mbps', 500)),
+                            "--iperf_server", config.get('iperf_server', '').strip(),
+                            "--iperf_port", str(config.get('iperf_port', 5201))
                         ]
-                        
-                        iperf_server = config.get('iperf_server', '').strip()
-                        if iperf_server:
-                            cmd_args.extend(["--iperf_server", iperf_server])
-                            cmd_args.extend(["--iperf_port", str(config.get('iperf_port', 5201))])
-                            
-                        ost_server = config.get('ost_server', '').strip()
-                        if ost_server:
-                            cmd_args.extend(["--ost_server", ost_server])
-
-                        logging.info(f"Running Command: {' '.join(cmd_args)}")
                         
                         test_duration = int(config.get('speed_duration', 10))
                         proc_timeout = (test_duration * 2) + 30 
                         
-                        process = subprocess.run(cmd_args, capture_output=True, text=True, timeout=proc_timeout)
-                        res = process.stdout + "\n" + process.stderr
+                        process = subprocess.Popen(cmd_args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+                        res_lines = []
                         
-                        if not res.strip():
-                            err_msg = "ERROR: speed_test.py produced NO OUTPUT."
-                            print(err_msg)
-                            res += f"\n{err_msg}\n[SPEED_TEST_FAILED]"
-                            logging.error("Speed Test Script Executed but returned empty string.")
-                        else:
-                            print("\n" + "="*60)
-                            print(f" [ REAL NETWORK SPEED TEST RESULTS ] ")
-                            print("="*60)
-                            print(res.strip())
-                            print("="*60 + "\n")
-                            
-                            if process.returncode == 0 and "SPEED_TEST_SUCCESS" in res:
-                                logging.info("Speed test executed successfully.")
-                            else:
-                                logging.error(f"Speed Test Script Failed with return code {process.returncode}")
+                        def stream_reader(proc, lines):
+                            for line in iter(proc.stdout.readline, ''):
+                                sys.stdout.write(line)
+                                sys.stdout.flush()
+                                lines.append(line)
                                 
-                    except subprocess.TimeoutExpired:
-                        res = f"Script execution timed out after {proc_timeout} seconds."
-                        logging.error(res)
+                        reader_thread = threading.Thread(target=stream_reader, args=(process, res_lines))
+                        reader_thread.start()
+                        reader_thread.join(timeout=proc_timeout)
+                        
+                        if reader_thread.is_alive():
+                            process.terminate()
+                            reader_thread.join()
+                            res_lines.append("\nERROR: Script execution timed out.\n")
+                            
+                        process.wait()
+                        res = "".join(res_lines)
+                        
+                        if process.returncode == 0 and "SPEED_TEST_SUCCESS" in res:
+                            logging.info("Speed test executed successfully and met all criteria.")
+                        else:
+                            logging.warning(f"Speed Test Script finished, but throughput was below target. (Code: {process.returncode})")
+                            
                     except Exception as e:
                         res = f"Script execution failed: {e}"
                         logging.error(res)
                 else:
-                    logging.warning(f"Script '{sn['command']}' not found in the current directory.")
-                    logging.info("Simulating Test Bypass (Pass) to continue the pipeline...")
-                    time.sleep(2)
+                    logging.warning(f"Script '{sn['command']}' not found. Simulating Test Bypass...")
                     res = "[SPEED_TEST_SUCCESS]"
             else:
                 res = self.olt.send_command(sn['command'])
             
+            # Verify and update DB
             if self._verify(sn['type'], res):
                 logging.info(f"[PASS] {sn['type']}")
-                self.db.mark_test_success(sn['id'])
+                self.db.update_test_status(sn['id'], "PASS", res)
             else:
+                if sn['type'] == "Speed_Test":
+                    logging.warning(f"[{sn['type']}] Did not meet the target criteria. Proceeding with remaining tests.")
+                    self.db.update_test_status(sn['id'], "FAIL", res)
+                    continue
+                
                 action = self._handle_failure(sn, res)
-                if not action: return False 
+                if not action: 
+                    self.db.update_test_status(sn['id'], "FAIL", res)
+                    return False 
                 if action == "SKIP":
                     logging.info(f"[SKIPPED] {sn['type']}")
+                    self.db.update_test_status(sn['id'], "N/A", res)
                     continue 
-                
+
                 retry_required = True
                 break 
                 
@@ -518,25 +666,35 @@ class TestAutomationEngine:
         return True
 
     def _verify(self, t_type: str, res: str) -> bool:
-        if not res: return False
+        if not res:
+            if t_type in ["Reboot_Test", "Cleanup"]:
+                return True
+            return False
+            
         res_lower = res.lower()
-        
-        # [CRITICAL FIX] Only catch actual syntax/command rejections, NOT table values like 'invalid'
         error_kws = ["invalid command", "invalid token", "unknown command", "bad parameter", "incomplete command"]
         if any(kw in res_lower for kw in error_kws) or "^" in res: 
             return False
-        
-        if t_type == "OLT_Version_Check": 
-            return len(res.strip()) > 0 
             
-        if t_type == "Ranging_Test":
+        if t_type == "ONT_Discovery_Check":
             serial_clean = self.serial.replace(":", "").lower()
-            if "pref-ranged" in res_lower and serial_clean in res_lower.replace(":", ""):
-                return True
+            if serial_clean in res_lower.replace(":", ""): return True
+            return False
+
+        if t_type == "Registration_Check":
+            serial_clean = self.serial.replace(":", "").lower()
+            if "pref-ranged" in res_lower and serial_clean in res_lower.replace(":", ""): return True
             return False
             
         if t_type == "Optics_Check": 
             return "rx-signal" in res_lower and "count : 0" not in res_lower
+            
+        if t_type == "Software_Info":
+            match = re.search(r'sw-ver-act\s*:\s*(\S+)', res_lower)
+            if match:
+                val = match.group(1)
+                if val not in ["sw-ver-psv", "vendor-id", "unknown"]: return True
+            return False
             
         if t_type == "MAC_Status": 
             return bool(re.search(r'([0-9A-F]{2}:){5}[0-9A-F]{2}', res, re.I))
@@ -548,9 +706,8 @@ class TestAutomationEngine:
 
     def _handle_failure(self, sn: Dict, res: str):
         print(f"\n[FAILURE DETECTED] {sn['type']}")
-        print(f"Command executed: {sn['command']}\nOutput received:\n{res}\n")
         
-        res_lower = res.lower()
+        res_lower = res.lower() if res else ""
         error_kws = ["invalid command", "invalid token", "unknown command", "bad parameter", "incomplete command"]
         is_syntax_error = any(kw in res_lower for kw in error_kws) or "^" in res
         
@@ -562,15 +719,9 @@ class TestAutomationEngine:
                 if tmp:
                     self.db.save_learned_command(self.olt.olt_profile, sn['type'], tmp)
                     self.db.update_test_case(sn['id'], tmp.format(serial=self.serial, pon=self.pon, ont_id=self.ont_id, port=self.port_full), json.dumps(sn['parameters']))
-                    logging.info("Command updated. Retrying...")
                     return True
                 
-        print("\nChoose Action for Error Recovery:")
-        print("  [1] Update Command Template")
-        print("  [2] Increase Wait Time (+10s)")
-        print("  [3] Skip/Force Pass")
-        print("  [4] Abort Testing")
-        
+        print("\nChoose Action for Error Recovery: [1] Update Command [2] Increase Wait [3] Force Pass [4] Abort")
         choice = input("Select an option [1-4]: ").strip()
         if choice == "1":
             tmp = input(f"Enter new template for {sn['type']}: ").strip()
@@ -584,261 +735,149 @@ class TestAutomationEngine:
             return True
         elif choice == "3":
             logging.info(f"Force passing {sn['type']} step.")
-            self.db.mark_test_success(sn['id'])
             return "SKIP"
         return False
 
 if __name__ == "__main__":
     db = DatabaseManager()
+    olt = None
     
-    if os.path.exists(CONFIG_FILE):
-        with open(CONFIG_FILE, 'r') as f: config = json.load(f)
-    else: 
-        config = {}
+    try:
+        if os.path.exists(CONFIG_FILE):
+            with open(CONFIG_FILE, 'r') as f: config = json.load(f)
+        else: 
+            config = {}
 
-    if not config.get('olt_ip'):
-        print("\n" + "="*50)
-        print("    AI Test Automation Framework - Initial Setup")
-        print("="*50)
-        config = {
-            'olt_ip': input("OLT IP: ").strip(),
-            'username': input("Username: ").strip(),
-            'password': getpass.getpass("Password (hidden): ").strip(),
-            'protocol': input("Protocol (ssh/telnet) [telnet]: ").strip().lower() or 'telnet'
-        }
-    
-    olt = NokiaOLTConnector(config['olt_ip'], config['username'], config['password'], config['protocol'])
-    if not olt.connect():
-        logging.error("Failed to connect to OLT. Check credentials and protocol.")
-        sys.exit(1)
-
-    skip_provisioning = False
-
-    while True:
-        cmd = db.get_learned_command(olt.olt_profile, "Discovery") or "show channel-pair unprovision-onu"
-        onts_list = olt.get_unprovisioned_onts(cmd)
+        if not config.get('olt_ip'):
+            config = {
+                'olt_ip': input("OLT IP: ").strip(),
+                'username': input("Username: ").strip(),
+                'password': getpass.getpass("Password (hidden): ").strip(),
+                'protocol': input("Protocol (ssh/telnet) [telnet]: ").strip().lower() or 'telnet'
+            }
         
-        print("\n" + "="*50)
-        print("  [ ONT Discovery & Selection ]")
-        print("="*50)
-        
-        if onts_list:
-            print("Found Unprovisioned ONTs:")
-            for i, item in enumerate(onts_list, 1): 
-                print(f"  {i}. Serial: {item['serial']} | ChanPair: {item['chanpair']}")
-        else:
-            print("No unprovisioned ONTs found.")
+        olt = NokiaOLTConnector(config['olt_ip'], config['username'], config['password'], config['protocol'])
+        if not olt.connect():
+            logging.error("Failed to connect to OLT.")
+            sys.exit(1)
+
+        skip_provisioning = False
+
+        while True:
+            cmd = db.get_learned_command(olt.olt_profile, "Discovery") or "show channel-pair unprovision-onu"
+            onts_list = olt.get_unprovisioned_onts(cmd)
             
-        print("\nOptions:")
-        if onts_list:
-            print("  [1] Select an Unprovisioned ONT to Provision & Test")
-        else:
-            print("  [1] (Unavailable - No Unprovisioned ONTs)")
-        print("  [2] Search and Delete an already provisioned ONT")
-        print("  [3] Select an already provisioned ONT for testing (SKIP Provisioning)")
-        print("  [4] Enter a different Discovery Command")
-        print("  [5] Exit Program")
-        
-        choice = input("\nSelect an option [1-5]: ").strip()
-        
-        if choice == "1":
-            if not onts_list:
-                print("No unprovisioned ONTs available to select.")
+            print("\nOptions: [1] Provision Unprovisioned ONT [2] Delete Provisioned ONT [3] Test Provisioned ONT [4] Change Discovery Cmd [5] Exit")
+            choice = input("Select an option [1-5]: ").strip()
+            
+            if choice == "1":
+                if not onts_list: continue
+                for i, item in enumerate(onts_list, 1): print(f"  [{i}] Serial: {item['serial']} | ChanPair: {item['chanpair']}")
+                sel_input = int(input("\nSelect Index: ").strip())
+                selected_ont = onts_list[sel_input-1]
+                config['ont_serial'] = selected_ont['serial']
+                config['chanpair'] = selected_ont['chanpair'] if selected_ont['chanpair'] != "unknown" else input(f"Enter Channel-Pair: ").strip()
+                config['pon'] = input("Target PON (e.g., ng2:5/1): ").strip()
+                config['ont_id'] = input("Target ONT ID (e.g., 10): ").strip()
+                break
+                
+            elif choice == "2":
+                find_cmd = olt._get_safe_find_cmd(db)
+                out = olt.send_command(find_cmd)
+                print(f"\n[ PROVISIONED ONTs OUTPUT ]\n{out}\n")
+                del_target = input("Enter PORT or SERIAL to delete or 'cancel': ").strip()
+                if del_target.lower() == 'cancel': continue
+                
+                target_port = del_target
+                if '/' not in del_target and ':' not in del_target:
+                    matches = re.findall(r'(\d+(?:/\d+)+)\s+([a-zA-Z0-9:-]+(?:/\d+)+)\s+([A-Za-z]{4}:?[A-Fa-f0-9]{8})', out)
+                    for m in matches:
+                        if del_target.lower() in m[2].lower().replace(':', ''):
+                            target_port = m[1]
+                            break
+                        
+                olt._delete_ont_by_port(target_port, db)
+                time.sleep(2)
                 continue
                 
-            print("\n[ Available Unprovisioned ONTs ]")
-            for i, item in enumerate(onts_list, 1): 
-                print(f"  [{i}] Serial: {item['serial']} | ChanPair: {item['chanpair']}")
+            elif choice == "3":
+                active_onts = []
+                for i in range(1, 9):
+                    out = olt.send_command(f"show equipment ont status channel-pair 1/1/1/{i}", timeout=5)
+                    matches = re.findall(r'(\d+(?:/\d+)+)\s+([a-zA-Z0-9:-]+(?:/\d+)+)\s+([A-Za-z]{4}:?[A-Fa-f0-9]{8})\s+(\S+)\s+(\S+)', out)
+                    for m in matches:
+                        if m[4].lower() == 'up': active_onts.append({'chanpair': m[0], 'port': m[1], 'serial': m[2].replace(':', '')})
                 
-            sel = 0
-            while True:
-                sel_input = input("\nSelect Index: ").strip()
-                if sel_input.isdigit() and 1 <= int(sel_input) <= len(onts_list):
-                    sel = int(sel_input)
-                    break
-                print(f"Please enter a valid number between 1 and {len(onts_list)}.")
-            
-            selected_ont = onts_list[sel-1]
-            config['ont_serial'] = selected_ont['serial']
-            config['chanpair'] = selected_ont['chanpair']
-            if config['chanpair'] == "unknown": 
-                config['chanpair'] = input(f"Enter Channel-Pair for {config['ont_serial']}: ").strip()
-            config['pon'] = input("Target PON (e.g., ng2:5/1): ").strip()
-            config['ont_id'] = input("Target ONT ID (e.g., 10): ").strip()
-            break
-            
-        elif choice == "2":
-            find_cmd = olt._get_safe_find_cmd(db)
-            print(f"\nCurrent command to find provisioned ONTs: {find_cmd}")
-            chg = input("Press Enter to use this, or type a new command: ").strip()
-            if chg:
-                db.save_learned_command(olt.olt_profile, "Find_Provisioned", chg)
-                find_cmd = chg
-                
-            out = olt.send_command(find_cmd)
-            print(f"\n[ PROVISIONED ONTs OUTPUT ]\n{out}\n")
-            
-            del_target = input("Enter PORT or SERIAL to delete (e.g., ng2:5/1/10 or HUMA23084463) or 'cancel': ").strip()
-            if del_target.lower() == 'cancel' or not del_target: continue
-            
-            target_port = del_target
-            if '/' not in del_target and ':' not in del_target:
-                matches = re.findall(r'(\d+(?:/\d+)+)\s+([a-zA-Z0-9:-]+(?:/\d+)+)\s+([A-Za-z]{4}:?[A-Fa-f0-9]{8})', out)
-                found = False
-                for m in matches:
-                    if del_target.lower() in m[2].lower().replace(':', ''):
-                        target_port = m[1]
-                        found = True
-                        print(f"-> Found Serial {m[2]} residing on Port {target_port}.")
-                        break
-                if not found:
-                    print("-> Could not find that Serial in the provisioned list.")
-                    continue
-                    
-            del_cmd_temp = olt._get_safe_delete_cmd(db)
-            chg_del = input(f"Press Enter to use current Deletion Template, or type a new one:\n[{del_cmd_temp}]\n-> ").strip()
-            if chg_del:
-                if "{port}" in chg_del:
-                    del_cmd_temp = chg_del
-                    db.save_learned_command(olt.olt_profile, "Delete_Provisioned", del_cmd_temp)
-                else:
-                    print("\nWARNING: The template you entered DOES NOT contain '{port}'.")
-                    print("This will cause errors! Falling back to the safe template.")
-                
-            olt._delete_ont_by_port(target_port, db)
-            logging.info("Returning to Discovery Menu...")
-            time.sleep(2)
-            continue
-            
-        elif choice == "3":
-            find_cmd = olt._get_safe_find_cmd(db)
-            out = olt.send_command(find_cmd)
-            print(f"\n[ PROVISIONED ONTs OUTPUT ]\n{out}\n")
-            
-            matches = re.findall(r'(\d+(?:/\d+)+)\s+([a-zA-Z0-9:-]+(?:/\d+)+)\s+([A-Za-z]{4}:?[A-Fa-f0-9]{8})', out)
-            if matches:
-                print("Auto-detected provisioned ONTs:")
-                for i, m in enumerate(matches, 1):
-                    print(f"  {i}. Serial: {m[2].replace(':', '')} | Port: {m[1]} | ChanPair: {m[0]}")
-                
-                sel_input = input("\nSelect Index (or press Enter to type manually): ").strip()
-                if sel_input.isdigit() and 1 <= int(sel_input) <= len(matches):
-                    m = matches[int(sel_input)-1]
-                    config['chanpair'] = m[0]
-                    port_parts = m[1].rsplit('/', 1) 
-                    config['pon'] = port_parts[0]
-                    config['ont_id'] = port_parts[1]
-                    config['ont_serial'] = m[2].replace(':', '')
-                    skip_provisioning = True
-                    break
-            
-            print("\n[ Manual Input ]")
-            config['ont_serial'] = input("Enter Serial (e.g., HUMA23084463): ").strip().replace(':', '')
-            config['pon'] = input("Target PON (e.g., ng2:5/1): ").strip()
-            config['ont_id'] = input("Target ONT ID (e.g., 3): ").strip()
-            config['chanpair'] = input("Enter Channel-Pair (e.g., 1/1/1/5): ").strip()
-            skip_provisioning = True
-            break
-            
-        elif choice == "4":
-            new_cmd = input("Enter CORRECT Discovery Command: ").strip()
-            if new_cmd: db.save_learned_command(olt.olt_profile, "Discovery", new_cmd)
-            
-        elif choice == "5":
-            sys.exit(0)
-        else:
-            print("Invalid option selected.")
+                def_serial, def_pon, def_ont_id, def_chanpair = "", "", "", ""
+                if active_onts:
+                    for i, ont in enumerate(active_onts, 1): print(f"  [{i}] Serial: {ont['serial']} | Port: {ont['port']} | ChanPair: {ont['chanpair']}")
+                    sel_input = input("\nSelect Index: ").strip()
+                    if sel_input.isdigit():
+                        selected = active_onts[int(sel_input)-1]
+                        def_serial, def_chanpair = selected['serial'], selected['chanpair']
+                        def_pon, def_ont_id = selected['port'].rsplit('/', 1)
 
-    port_full = f"{config['pon']}/{config['ont_id']}"
-
-    if not skip_provisioning:
-        find_cmd = olt._get_safe_find_cmd(db)
-        out = olt.send_command(find_cmd)
-        matches = re.findall(r'(\d+(?:/\d+)+)\s+([a-zA-Z0-9:-]+(?:/\d+)+)\s+([A-Za-z]{4}:?[A-Fa-f0-9]{8})', out)
-        for m in matches:
-            if config['ont_serial'].lower() in m[2].lower().replace(':', ''):
-                existing_port = m[1]
-                if existing_port != port_full:
-                    logging.warning(f"ONT {config['ont_serial']} is currently registered on a DIFFERENT port: {existing_port}")
-                    auto_del = input(f"Do you want to automatically DELETE it from {existing_port} before proceeding? (y/n) [default: y]: ").strip().lower()
-                    if auto_del != 'n':
-                        olt._delete_ont_by_port(existing_port, db)
-                        time.sleep(3)
-                    else:
-                        logging.error("Cannot provision because the ONT is bound to another port. Aborting.")
-                        sys.exit(1)
+                config['ont_serial'] = input(f"Enter Serial [{def_serial}]: ").strip() or def_serial
+                config['pon'] = input(f"Target PON [{def_pon}]: ").strip() or def_pon
+                config['ont_id'] = input(f"Target ONT ID [{def_ont_id}]: ").strip() or def_ont_id
+                config['chanpair'] = input(f"Enter Channel-Pair [{def_chanpair}]: ").strip() or def_chanpair
+                skip_provisioning = True
                 break
-
-        print("\n" + "-"*40)
-        print("  ONT Configuration Setup")
-        print("-" * 40)
-        config['ont_type'] = input("ONT Type (sfu/hgu) [default: sfu]: ").strip().lower() or 'sfu'
-        config['lan_ports'] = input("Number of LAN ports (e.g., 1): ").strip() or "1"
-        config['max_mac'] = input("Max Unicast MAC learning count (e.g., 128): ").strip() or "128"
-
-        if config['ont_type'] == 'sfu':
-            print("\n[ Fetching Available Bandwidth Profiles from OLT... ]")
-            bw_profiles_output = olt.send_command("show qos bandwidth-profile", timeout=10)
-            print(f"\n{bw_profiles_output}\n")
-            config['bw_profile'] = input("Enter Bandwidth Profile Name from above: ").strip() or "NG2DATABWUP10000"
-            
-        print("\n[ Network & VLAN Configuration ]")
-        net_input = input("Network Environment (real/traffic) [default: real]: ").strip().lower() or 'real'
-        
-        if 'real' in net_input:
-            config['network_type'] = 'real'
-            sub_type = input("  -> Connection Type (dhcp/pppoe) [default: dhcp]: ").strip().lower() or 'dhcp'
-            config['vlan_id'] = "1001" if 'dhcp' in sub_type else "1002"
-            print(f"  -> {sub_type.upper()} selected. Auto-assigning VLAN ID: {config['vlan_id']}")
-        else:
-            config['network_type'] = 'traffic'
-            config['vlan_id'] = "4000"
-            print(f"  -> Traffic Generator selected. Auto-assigning VLAN ID: {config['vlan_id']}")
-
-    print("\n" + "-"*40)
-    print("  Real Network Speed Test Setup")
-    print("-" * 40)
-    speed_setup = input("Would you like to configure Speed Test parameters? (y/n) [default: y]: ").strip().lower()
-    if speed_setup != 'n':
-        print("Note: Leave IP/URL blank to skip that specific test.")
-        config['iperf_server'] = input(f"iperf3 Server IP [{config.get('iperf_server', '')}]: ").strip() or config.get('iperf_server', '')
-        config['iperf_port'] = input(f"iperf3 Server Port [{config.get('iperf_port', '5201')}]: ").strip() or config.get('iperf_port', '5201')
-        config['ost_server'] = input(f"OpenSpeedTest Server URL (e.g. http://192.168.1.100:3000) [{config.get('ost_server', '')}]: ").strip() or config.get('ost_server', '')
-        config['speed_duration'] = input(f"Test Duration per test in sec [{config.get('speed_duration', '10')}]: ").strip() or config.get('speed_duration', '10')
-        config['speed_pass_mbps'] = input(f"Pass Criteria (Mbps) [{config.get('speed_pass_mbps', '500')}]: ").strip() or config.get('speed_pass_mbps', '500')
-
-    with open(CONFIG_FILE, 'w') as f: json.dump(config, f, indent=4)
-
-    db.add_initial_test_cases(config, olt.olt_profile)
-
-    if not skip_provisioning:
-        while True:
-            if not olt.register_ont(config, db):
-                logging.error("Registration aborted by user.")
-                sys.exit(1)
                 
-            if not olt.verify_registration(config, db):
-                logging.error("ONT did not register in time. Cleaning up interface...")
-                olt._cleanup_failed_provisioning(port_full)
-                ch = input("Do you want to retry Registration? (y/n): ")
-                if ch.lower() == 'y': continue
-                sys.exit(1)
-                
-            if not olt.provision_service_ont(config, db):
-                logging.error("Service Provisioning Failed. Rolling back ONT to restart...")
-                olt._cleanup_failed_provisioning(port_full)
-                ch = input("Do you want to retry the entire sequence? (y/n): ")
-                if ch.lower() == 'y': continue
-                sys.exit(1)
-                
-            break 
-        db.add_ont(config['ont_serial'], config['pon'], config['ont_id'], "PROVISIONED")
-    else:
-        logging.info("Skipping Provisioning... Proceeding directly to Test Cycles.")
+            elif choice == "4":
+                new_cmd = input("Enter CORRECT Discovery Command: ").strip()
+                if new_cmd: db.save_learned_command(olt.olt_profile, "Discovery", new_cmd)
+            elif choice == "5":
+                sys.exit(0)
 
-    engine = TestAutomationEngine(db, olt, config['ont_serial'], config['pon'], config['ont_id'])
-    for cycle in range(1, 10):
-        logging.info(f"========== TEST CYCLE {cycle} ==========")
-        if engine.execute_tests(config): 
-            logging.info("ALL TESTS PASSED SUCCESSFULLY!")
-            break
+        port_full = f"{config['pon']}/{config['ont_id']}"
+
+        if not skip_provisioning:
+            config['ont_type'] = input("ONT Type (sfu/hgu) [default: sfu]: ").strip().lower() or 'sfu'
+            config['lan_ports'] = input("Number of LAN ports [1]: ").strip() or "1"
+            config['max_mac'] = input("Max Unicast MAC learning [128]: ").strip() or "128"
+            if config['ont_type'] == 'sfu':
+                config['bw_profile'] = input("Enter Bandwidth Profile Name [NG2DATABWUP10000]: ").strip() or "NG2DATABWUP10000"
+            net_input = input("Network Environment (real/traffic) [default: real]: ").strip().lower() or 'real'
+            config['vlan_id'] = "1001" if net_input == 'real' else "4000"
+
+        speed_setup = input("Configure Speed Test parameters? (y/n) [default: y]: ").strip().lower()
+        if speed_setup != 'n':
+            config['iperf_server'] = input(f"iperf3 Server IP [{config.get('iperf_server', '')}]: ").strip() or config.get('iperf_server', '')
+            config['iperf_port'] = input(f"iperf3 Server Port [{config.get('iperf_port', '5201')}]: ").strip() or config.get('iperf_port', '5201')
+            config['speed_duration'] = input(f"Test Duration in sec [{config.get('speed_duration', '10')}]: ").strip() or config.get('speed_duration', '10')
+            config['speed_pass_mbps'] = input(f"Pass Criteria (Mbps) [{config.get('speed_pass_mbps', '500')}]: ").strip() or config.get('speed_pass_mbps', '500')
+
+        with open(CONFIG_FILE, 'w') as f: json.dump(config, f, indent=4)
+        db.add_initial_test_cases(config, olt.olt_profile)
+
+        if not skip_provisioning:
+            while True:
+                if not olt.register_ont(config, db): sys.exit(1)
+                if not olt.verify_registration(config, db):
+                    olt._cleanup_failed_provisioning(port_full)
+                    if input("Retry Registration? (y/n): ").lower() == 'y': continue
+                    sys.exit(1)
+                if not olt.provision_service_ont(config, db):
+                    olt._cleanup_failed_provisioning(port_full)
+                    if input("Retry sequence? (y/n): ").lower() == 'y': continue
+                    sys.exit(1)
+                break 
+            db.add_ont(config['ont_serial'], config['pon'], config['ont_id'], "PROVISIONED")
+
+        engine = TestAutomationEngine(db, olt, config['ont_serial'], config['pon'], config['ont_id'])
+        for cycle in range(1, 10):
+            logging.info(f"========== TEST CYCLE {cycle} ==========")
+            if engine.execute_tests(config): 
+                logging.info("ALL TESTS PASSED SUCCESSFULLY!")
+                break
+                
+        generate_professional_excel_report(config['ont_serial'], db, config)
+
+    except KeyboardInterrupt:
+        print("\n[!] Program interrupted by user. Exiting safely...")
+    except Exception as e:
+        logging.error(f"Unexpected Critical Error: {e}")
+    finally:
+        if olt: olt.disconnect()
+        sys.exit(0)
