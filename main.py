@@ -8,6 +8,7 @@ import getpass
 import re
 import subprocess
 import threading
+import csv
 from datetime import datetime
 from typing import List, Dict, Tuple
 
@@ -18,7 +19,6 @@ except ImportError:
     logging.error("Netmiko library is not installed. Please run: pip install netmiko")
     sys.exit(1)
 
-# [NEW] Excel Library Check
 try:
     import openpyxl
     from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
@@ -43,7 +43,6 @@ def generate_professional_excel_report(serial: str, db, config: Dict):
     try:
         wb = openpyxl.Workbook()
         
-        # Define Styles
         bold_font = Font(bold=True)
         title_font = Font(size=16, bold=True, color="FFFFFF")
         hdr_fill = PatternFill(start_color="4F81BD", end_color="4F81BD", fill_type="solid")
@@ -54,9 +53,7 @@ def generate_professional_excel_report(serial: str, db, config: Dict):
         center_align = Alignment(horizontal="center", vertical="center")
         thin_border = Border(left=Side(style='thin'), right=Side(style='thin'), top=Side(style='thin'), bottom=Side(style='thin'))
 
-        # =========================================================================
         # SHEET 1: SUMMARY
-        # =========================================================================
         ws_sum = wb.active
         ws_sum.title = "Summary"
         
@@ -66,7 +63,6 @@ def generate_professional_excel_report(serial: str, db, config: Dict):
         title_cell.alignment = center_align
         title_cell.fill = hdr_fill
         
-        # Calculate Metrics
         total = len(cases)
         c_pass = sum(1 for c in cases if c['status'] == 'PASS')
         c_fail = sum(1 for c in cases if c['status'] == 'FAIL')
@@ -102,9 +98,7 @@ def generate_professional_excel_report(serial: str, db, config: Dict):
         ws_sum.column_dimensions['B'].width = 20
         ws_sum.column_dimensions['C'].width = 30
 
-        # =========================================================================
         # SHEET 2: DETAILS
-        # =========================================================================
         ws_det = wb.create_sheet(title="Details")
         headers = ["Test Order", "Test Item", "Command / Script", "Result"]
         for col_num, header in enumerate(headers, 1):
@@ -133,9 +127,7 @@ def generate_professional_excel_report(serial: str, db, config: Dict):
         ws_det.column_dimensions['C'].width = 80
         ws_det.column_dimensions['D'].width = 15
 
-        # =========================================================================
         # SHEET 3: LOGS & GRAPH
-        # =========================================================================
         ws_log = wb.create_sheet(title="Logs & Graph")
         ws_log.cell(row=1, column=1, value="Test Item").font = bold_font
         ws_log.cell(row=1, column=2, value="Execution Log").font = bold_font
@@ -154,10 +146,8 @@ def generate_professional_excel_report(serial: str, db, config: Dict):
                 if not clean_line: continue
                 ws_log.cell(row=log_row, column=2, value=clean_line)
                 
-                # Parse iperf3 logs for graph data
                 if c['type'] == 'Speed_Test' and "[SUM]" in clean_line and "sec" in clean_line and "bits/sec" in clean_line:
                     if "sender" not in clean_line and "receiver" not in clean_line:
-                        # Extract Time and Mbps
                         match = re.search(r'\[SUM\]\s+\d+\.\d+-\s*(\d+\.\d+)\s+sec.*?\s+(\d+(?:\.\d+)?)\s+([KMG])bits/sec', clean_line)
                         if match:
                             end_time = float(match.group(1))
@@ -168,7 +158,6 @@ def generate_professional_excel_report(serial: str, db, config: Dict):
                 log_row += 1
             log_row += 1 
 
-        # Draw Chart if Speed Data Exists
         if speed_data_rows:
             ws_log.cell(row=1, column=4, value="Time (sec)").font = bold_font
             ws_log.cell(row=1, column=5, value="Throughput (Mbps)").font = bold_font
@@ -225,7 +214,6 @@ class DatabaseManager:
             cursor.execute('''CREATE TABLE IF NOT EXISTS learned_commands (
                 olt_profile TEXT, test_type TEXT, command_template TEXT, PRIMARY KEY (olt_profile, test_type))''')
             
-            # Upgrade Schema for Excel Reporting gracefully
             try: cursor.execute("ALTER TABLE test_cases ADD COLUMN status TEXT DEFAULT 'N/T'")
             except: pass
             try: cursor.execute("ALTER TABLE test_cases ADD COLUMN execution_log TEXT")
@@ -270,9 +258,9 @@ class DatabaseManager:
     def load_test_cases(self, serial: str) -> List[Dict]:
         with self._get_conn() as conn:
             cursor = conn.cursor()
-            cursor.execute('SELECT id, target_serial, execution_order, test_type, command, parameters, status, execution_log FROM test_cases WHERE target_serial = ? ORDER BY execution_order ASC', (serial,))
+            cursor.execute('SELECT id, target_serial, execution_order, test_type, command, parameters, status, execution_log, success_count FROM test_cases WHERE target_serial = ? ORDER BY execution_order ASC', (serial,))
             rows = cursor.fetchall()
-            return [{"id": r[0], "serial": r[1], "order": r[2], "type": r[3], "command": r[4], "parameters": json.loads(r[5]), "status": r[6], "log": r[7]} for r in rows]
+            return [{"id": r[0], "serial": r[1], "order": r[2], "type": r[3], "command": r[4], "parameters": json.loads(r[5]), "status": r[6], "log": r[7], "success_count": r[8]} for r in rows]
 
     def add_initial_test_cases(self, config: Dict, profile: str):
         serial = config['ont_serial']
@@ -297,7 +285,7 @@ class DatabaseManager:
                 "Speed_Test": "speed_test.py", 
                 "MAC_Status": "show vlan bridge-port-fdb {port}/1/1",
                 "Reboot_Test": "admin equipment ont interface {port} reboot",
-                "Cleanup": "configure equipment ont interface no sernum {port}"
+                "Cleanup": "configure equipment ont interface {port} admin-state down ; configure equipment ont no interface {port}"
             }
             
             cursor.execute('SELECT test_type, command_template FROM learned_commands WHERE olt_profile = ?', (profile,))
@@ -566,19 +554,21 @@ class NokiaOLTConnector:
             if success: return True
 
 class TestAutomationEngine:
-    def __init__(self, db: DatabaseManager, olt: NokiaOLTConnector, serial: str, pon: str, ont_id: str):
+    def __init__(self, db: DatabaseManager, olt: NokiaOLTConnector, config: Dict):
         self.db = db
         self.olt = olt
-        self.serial = serial
-        self.pon = pon
-        self.ont_id = ont_id
-        self.port_full = f"{pon}/{ont_id}"
+        self.config = config
+        self.serial = config['ont_serial']
+        self.pon = config['pon']
+        self.ont_id = config['ont_id']
+        self.chanpair = config.get('chanpair', '')
+        self.port_full = f"{self.pon}/{self.ont_id}"
         
-        vendor_id = serial[:4]
-        sn_rem = serial[4:]
+        vendor_id = self.serial[:4]
+        sn_rem = self.serial[4:]
         self.serial_formatted = f"{vendor_id}:{sn_rem}"
 
-    def execute_tests(self, config: Dict) -> bool:
+    def execute_tests(self) -> bool:
         scenarios = self.db.load_test_cases(self.serial)
         retry_required = False
         
@@ -589,18 +579,19 @@ class TestAutomationEngine:
                 time.sleep(sn['parameters']['wait'])
             
             res = ""
+            
             if sn['type'] == "Speed_Test":
                 if os.path.exists(sn['command']):
                     try:
                         cmd_args = [
                             sys.executable, sn['command'],
-                            "--duration", str(config.get('speed_duration', 10)),
-                            "--pass_criteria", str(config.get('speed_pass_mbps', 500)),
-                            "--iperf_server", config.get('iperf_server', '').strip(),
-                            "--iperf_port", str(config.get('iperf_port', 5201))
+                            "--duration", str(self.config.get('speed_duration', 10)),
+                            "--pass_criteria", str(self.config.get('speed_pass_mbps', 500)),
+                            "--iperf_server", self.config.get('iperf_server', '').strip(),
+                            "--iperf_port", str(self.config.get('iperf_port', 5201))
                         ]
                         
-                        test_duration = int(config.get('speed_duration', 10))
+                        test_duration = int(self.config.get('speed_duration', 10))
                         proc_timeout = (test_duration * 2) + 30 
                         
                         process = subprocess.Popen(cmd_args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
@@ -625,7 +616,7 @@ class TestAutomationEngine:
                         res = "".join(res_lines)
                         
                         if process.returncode == 0 and "SPEED_TEST_SUCCESS" in res:
-                            logging.info("Speed test executed successfully and met all criteria.")
+                            logging.info("Speed test executed successfully.")
                         else:
                             logging.warning(f"Speed Test Script finished, but throughput was below target. (Code: {process.returncode})")
                             
@@ -633,10 +624,51 @@ class TestAutomationEngine:
                         res = f"Script execution failed: {e}"
                         logging.error(res)
                 else:
-                    logging.warning(f"Script '{sn['command']}' not found. Simulating Test Bypass...")
+                    logging.warning(f"Script '{sn['command']}' not found. Simulating Bypass...")
                     res = "[SPEED_TEST_SUCCESS]"
+                    
+            elif sn['type'] == "Reboot_Test":
+                logging.info("Sending Reboot Command to OLT...")
+                res_initial = self.olt.send_command(sn['command'])
+                logging.info("Command sent. Waiting 10 seconds for ONT to drop offline...")
+                time.sleep(10)
+                
+                logging.info("Polling until ONT comes back online (Max 5 mins)...")
+                start_t = time.time()
+                reboot_success = False
+                verify_cmd = f"show equipment ont status channel-pair {self.chanpair}"
+                
+                for attempt in range(60):
+                    out = self.olt.send_command(verify_cmd, timeout=5)
+                    match_line = [line for line in out.split('\n') if self.serial_formatted.lower() in line.lower() and self.port_full.lower() in line.lower()]
+                    if match_line:
+                        tokens = match_line[0].strip().lower().split()
+                        if "up" in tokens:
+                            reboot_success = True
+                            break
+                    time.sleep(5)
+                    
+                elapsed = time.time() - start_t
+                if reboot_success:
+                    res = f"[REBOOT_SUCCESS] ONT online after {elapsed:.1f} seconds.\n" + res_initial
+                    logging.info(f"ONT Rebooted and Online in {elapsed:.1f} seconds!")
+                else:
+                    res = f"[REBOOT_FAILED] ONT did not come online within timeout.\n" + res_initial
+                    logging.error("Reboot timeout reached!")
+                    
             else:
-                res = self.olt.send_command(sn['command'])
+                # Handle commands split by ';' (e.g. Cleanup)
+                if ';' in sn['command']:
+                    res_lines = []
+                    for c in sn['command'].split(';'):
+                        c = c.strip()
+                        if c:
+                            logging.info(f"Executing: {c}")
+                            out = self.olt.send_command(c)
+                            res_lines.append(out)
+                    res = "\n".join(res_lines)
+                else:
+                    res = self.olt.send_command(sn['command'])
             
             # Verify and update DB
             if self._verify(sn['type'], res):
@@ -667,8 +699,7 @@ class TestAutomationEngine:
 
     def _verify(self, t_type: str, res: str) -> bool:
         if not res:
-            if t_type in ["Reboot_Test", "Cleanup"]:
-                return True
+            if t_type in ["Cleanup"]: return True
             return False
             
         res_lower = res.lower()
@@ -698,6 +729,9 @@ class TestAutomationEngine:
             
         if t_type == "MAC_Status": 
             return bool(re.search(r'([0-9A-F]{2}:){5}[0-9A-F]{2}', res, re.I))
+            
+        if t_type == "Reboot_Test":
+            return "[REBOOT_SUCCESS]" in res
             
         if t_type == "Speed_Test":
             return "[SPEED_TEST_SUCCESS]" in res
@@ -865,10 +899,10 @@ if __name__ == "__main__":
                 break 
             db.add_ont(config['ont_serial'], config['pon'], config['ont_id'], "PROVISIONED")
 
-        engine = TestAutomationEngine(db, olt, config['ont_serial'], config['pon'], config['ont_id'])
+        engine = TestAutomationEngine(db, olt, config)
         for cycle in range(1, 10):
             logging.info(f"========== TEST CYCLE {cycle} ==========")
-            if engine.execute_tests(config): 
+            if engine.execute_tests(): 
                 logging.info("ALL TESTS PASSED SUCCESSFULLY!")
                 break
                 
