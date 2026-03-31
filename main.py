@@ -23,6 +23,7 @@ try:
     import openpyxl
     from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
     from openpyxl.chart import LineChart, Reference
+    from openpyxl.chart.marker import Marker
     EXCEL_SUPPORT = True
 except ImportError:
     logging.warning("openpyxl is not installed! Excel report generation will be skipped. Run 'pip install openpyxl'")
@@ -73,6 +74,7 @@ def generate_professional_excel_report(serial: str, db, config: Dict):
         info = [
             ("Target Serial", serial),
             ("Target PON / ID", f"{config.get('pon', 'N/A')} / {config.get('ont_id', 'N/A')}"),
+            ("Software Version", config.get('sw_version', 'Unknown')),
             ("Test Date", datetime.now().strftime('%Y-%m-%d %H:%M:%S')),
             ("Total Tests", total),
             ("PASS", c_pass),
@@ -135,7 +137,9 @@ def generate_professional_excel_report(serial: str, db, config: Dict):
         ws_log.column_dimensions['B'].width = 100
         
         log_row = 2
-        speed_data_rows = []
+        up_data = {}
+        dl_data = {}
+        current_mode = "UPLOAD"
         
         for c in cases:
             ws_log.cell(row=log_row, column=1, value=c['type']).font = bold_font
@@ -144,44 +148,83 @@ def generate_professional_excel_report(serial: str, db, config: Dict):
             for line in log_lines:
                 clean_line = line.strip()
                 if not clean_line: continue
+                
+                clean_line = re.sub(r'[\x00-\x08\x0b-\x0c\x0e-\x1f]', '', clean_line)
+                if clean_line.startswith('='):
+                    clean_line = "'" + clean_line
+
                 ws_log.cell(row=log_row, column=2, value=clean_line)
                 
-                if c['type'] == 'Speed_Test' and "[SUM]" in clean_line and "sec" in clean_line and "bits/sec" in clean_line:
-                    if "sender" not in clean_line and "receiver" not in clean_line:
-                        match = re.search(r'\[SUM\]\s+\d+\.\d+-\s*(\d+\.\d+)\s+sec.*?\s+(\d+(?:\.\d+)?)\s+([KMG])bits/sec', clean_line)
-                        if match:
-                            end_time = float(match.group(1))
-                            val = float(match.group(2))
-                            unit = match.group(3)
-                            mbps = val * 1000 if unit == 'G' else (val if unit == 'M' else val / 1000)
-                            speed_data_rows.append((end_time, mbps))
+                if c['type'] == 'Speed_Test':
+                    if "--- STARTING DOWNLOAD TEST ---" in clean_line:
+                        current_mode = "DOWNLOAD"
+                    elif "--- STARTING UPLOAD TEST ---" in clean_line:
+                        current_mode = "UPLOAD"
+                        
+                    if "[SUM]" in clean_line and "sec" in clean_line and "bits/sec" in clean_line:
+                        if "sender" not in clean_line and "receiver" not in clean_line:
+                            match = re.search(r'\[SUM\]\s+\d+\.\d+-\s*(\d+\.\d+)\s+sec.*?\s+(\d+(?:\.\d+)?)\s+([KMG])bits/sec', clean_line)
+                            if match:
+                                end_time_float = float(match.group(1))
+                                # [CRITICAL FIX] Align times to exact integers so Up/Down share the exact same X-axis keys
+                                t_sec = int(round(end_time_float))
+                                val = float(match.group(2))
+                                unit = match.group(3)
+                                mbps = val * 1000 if unit == 'G' else (val if unit == 'M' else val / 1000)
+                                
+                                if current_mode == "UPLOAD":
+                                    up_data[t_sec] = max(up_data.get(t_sec, 0), mbps)
+                                else:
+                                    dl_data[t_sec] = max(dl_data.get(t_sec, 0), mbps)
                 log_row += 1
             log_row += 1 
 
-        if speed_data_rows:
+        if up_data or dl_data:
             ws_log.cell(row=1, column=4, value="Time (sec)").font = bold_font
-            ws_log.cell(row=1, column=5, value="Throughput (Mbps)").font = bold_font
+            ws_log.cell(row=1, column=5, value="Upload (Mbps)").font = bold_font
+            ws_log.cell(row=1, column=6, value="Download (Mbps)").font = bold_font
+            
+            all_times = sorted(list(set(list(up_data.keys()) + list(dl_data.keys()))))
             
             r_idx = 2
-            for t_sec, speed in speed_data_rows:
-                ws_log.cell(row=r_idx, column=4, value=t_sec)
-                ws_log.cell(row=r_idx, column=5, value=speed)
-                r_idx += 1
+            if all_times:
+                max_time = max(all_times)
+                # Ensure no None values by carrying over the last recorded speed (forward-fill)
+                last_up = None
+                last_dl = None
+                
+                for t in range(1, max_time + 1):
+                    val_up = up_data.get(t, last_up)
+                    val_dl = dl_data.get(t, last_dl)
+                    
+                    ws_log.cell(row=r_idx, column=4, value=t)
+                    ws_log.cell(row=r_idx, column=5, value=val_up)
+                    ws_log.cell(row=r_idx, column=6, value=val_dl)
+                    
+                    if val_up is not None: last_up = val_up
+                    if val_dl is not None: last_dl = val_dl
+                    r_idx += 1
                 
             chart = LineChart()
-            chart.title = "iPerf3 Throughput over Time"
-            chart.style = 13
+            chart.title = "iPerf3 Throughput over Time (Up/Down)"
             chart.y_axis.title = 'Throughput (Mbps)'
             chart.x_axis.title = 'Time (sec)'
-            chart.width = 18
+            chart.width = 20
             chart.height = 10
             
-            data = Reference(ws_log, min_col=5, min_row=1, max_row=r_idx-1)
+            # Select columns 5 (Upload) and 6 (Download) for Y-axis
+            data = Reference(ws_log, min_col=5, max_col=6, min_row=1, max_row=r_idx-1)
+            # Select column 4 (Time) for X-axis
             cats = Reference(ws_log, min_col=4, min_row=2, max_row=r_idx-1)
+            
             chart.add_data(data, titles_from_data=True)
             chart.set_categories(cats)
             
-            ws_log.add_chart(chart, "G2")
+            # [CRITICAL FIX] Add circle markers (dots connected by lines)
+            for s in chart.series:
+                s.marker = Marker(symbol='circle', size=5)
+            
+            ws_log.add_chart(chart, "H2")
 
         wb.save(filename)
         print("\n" + "="*60)
@@ -279,12 +322,12 @@ class DatabaseManager:
             templates = {
                 "ONT_Discovery_Check": "show equipment ont status channel-pair {chanpair}", 
                 "Registration_Check": "show equipment ont status channel-pair {chanpair}", 
+                "Reboot_Test": "admin equipment ont interface {port} reboot with-active-image",
                 "Optics_Check": "show equipment ont optics {port}",
                 "UNI_Status": "show equipment ont interface {port}",
                 "Software_Info": "show equipment ont interface {port} detail",
                 "Speed_Test": "Native iperf3 Execution", 
                 "MAC_Status": "show vlan bridge-port-fdb {port}/1/1",
-                "Reboot_Test": "admin equipment ont interface {port} reboot with-active-image",
                 "Cleanup": "configure equipment ont interface {port} admin-state down ; configure equipment ont no interface {port}"
             }
             
@@ -358,7 +401,6 @@ class NokiaOLTConnector:
         m = re.search(r'(\d+\.\d+\.\S+)', out)
         self.olt_profile = f"Nokia_OS_{m.group(1)}" if m else "Nokia_Unknown"
 
-    # [CRITICAL FIX] Auto-Reconnect logic added for handling NIC flaps during ONT reboot
     def send_command(self, cmd: str, timeout: int = 15, retry: bool = True) -> str:
         if self.connection:
             try: 
@@ -437,6 +479,10 @@ class NokiaOLTConnector:
         
         reg_key = f"Registration_{config['ont_type'].upper()}"
         learned_cmds = db.get_learned_command(self.olt_profile, reg_key)
+        
+        if learned_cmds and "admin-state up" not in learned_cmds.lower():
+            logging.warning("Learned registration command is missing critical 'admin-state up' step. Reverting to default sequence.")
+            learned_cmds = None
         
         if learned_cmds:
             cmd_templates = [c.strip() for c in learned_cmds.split(';') if c.strip()]
@@ -529,6 +575,10 @@ class NokiaOLTConnector:
         prov_key = f"Provisioning_Service_{config['ont_type'].upper()}"
         learned_cmds = db.get_learned_command(self.olt_profile, prov_key)
         
+        if learned_cmds and "vlan-id" not in learned_cmds.lower():
+            logging.warning("Learned provisioning command seems incomplete. Reverting to default sequence.")
+            learned_cmds = None
+            
         if learned_cmds:
             cmd_templates = [c.strip() for c in learned_cmds.split(';') if c.strip()]
         else:
@@ -608,62 +658,72 @@ class TestAutomationEngine:
                     res = "[SPEED_TEST_SUCCESS] Skipped (No server)"
                     self.db.update_test_status(sn['id'], "PASS", res)
                     continue
-                    
-                cmd_args = ['iperf3', '-c', server, '-p', port, '-t', duration, '-P', '8']
-                logging.info(f"Running Native iperf3: {' '.join(cmd_args)}")
-                
-                print("\n" + "="*68)
-                print(f"{'Time':<8} | {'Progress Graph':<42} | {'Throughput':<15}")
-                print("="*68)
                 
                 try:
-                    proc = subprocess.Popen(cmd_args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+                    overall_up = 0.0
+                    overall_dl = 0.0
+                    full_log = []
                     
-                    overall_sent = 0.0
-                    overall_recv = 0.0
-                    log_capture = []
+                    base_args = ['iperf3', '-c', server, '-p', port, '-t', duration, '-P', '8']
+                    tests = [("UPLOAD", base_args), ("DOWNLOAD", base_args + ['-R'])]
                     
-                    for line in iter(proc.stdout.readline, ''):
-                        log_capture.append(line)
-                        if "[SUM]" in line and "bits/sec" in line and "sender" not in line and "receiver" not in line:
-                            match = re.search(r'\[SUM\]\s+\d+\.\d+-\s*(\d+\.\d+)\s+sec.*?\s+(\d+(?:\.\d+)?)\s+([KMG])bits/sec', line)
-                            if match:
-                                sec_val = match.group(1)
-                                val = float(match.group(2))
-                                unit = match.group(3)
-                                mbps = val * 1000 if unit == 'G' else (val if unit == 'M' else val / 1000)
-                                
-                                bar_len = 40
-                                max_val = max(criteria * 1.2, 10000)
-                                filled = min(int((mbps / max_val) * bar_len), bar_len)
-                                bar = '█' * filled + '-' * (bar_len - filled)
-                                
-                                print(f"[{sec_val:>5}s] [{bar}] {mbps:8.2f} Mbps")
-                                
-                    proc.wait()
-                    print("="*68 + "\n")
-                    
-                    out_text = "".join(log_capture)
-                    sender_matches = re.findall(r'\[SUM\].*?\s+(\d+(?:\.\d+)?)\s+([KMG])bits/sec\s+sender', out_text)
-                    recv_matches = re.findall(r'\[SUM\].*?\s+(\d+(?:\.\d+)?)\s+([KMG])bits/sec\s+receiver', out_text)
-                    
-                    if sender_matches:
-                        v, u = float(sender_matches[-1][0]), sender_matches[-1][1]
-                        overall_sent = v * 1000 if u == 'G' else (v if u == 'M' else v / 1000)
-                    if recv_matches:
-                        v, u = float(recv_matches[-1][0]), recv_matches[-1][1]
-                        overall_recv = v * 1000 if u == 'G' else (v if u == 'M' else v / 1000)
+                    for t_name, t_args in tests:
+                        logging.info(f"Running Native iperf3 {t_name}: {' '.join(t_args)}")
+                        print("\n" + "="*68)
+                        print(f"[{t_name}] {'Time':<8} | {'Progress Graph':<42} | {'Throughput':<15}")
+                        print("="*68)
                         
-                    if proc.returncode != 0:
-                        res = f"[SPEED_TEST_FAILED] iperf3 returned code {proc.returncode}\n{out_text}"
-                        logging.warning(f"Speed Test failed or aborted.")
-                    else:
-                        res = f"[SPEED_TEST_SUCCESS] Upload: {overall_sent:.2f} Mbps, Download: {overall_recv:.2f} Mbps\n{out_text}"
-                        if overall_sent >= criteria or overall_recv >= criteria:
-                            logging.info(f"Speed test passed criteria! (Up: {overall_sent:.2f} Mbps, Down: {overall_recv:.2f} Mbps)")
+                        full_log.append(f"--- STARTING {t_name} TEST ---\n")
+                        
+                        proc = subprocess.Popen(t_args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+                        direction_log = []
+                        
+                        for line in iter(proc.stdout.readline, ''):
+                            direction_log.append(line)
+                            full_log.append(line)
+                            if "[SUM]" in line and "bits/sec" in line and "sender" not in line and "receiver" not in line:
+                                match = re.search(r'\[SUM\]\s+\d+\.\d+-\s*(\d+\.\d+)\s+sec.*?\s+(\d+(?:\.\d+)?)\s+([KMG])bits/sec', line)
+                                if match:
+                                    sec_val = match.group(1)
+                                    val = float(match.group(2))
+                                    unit = match.group(3)
+                                    mbps = val * 1000 if unit == 'G' else (val if unit == 'M' else val / 1000)
+                                    
+                                    bar_len = 40
+                                    max_val = max(criteria * 1.2, 10000)
+                                    filled = min(int((mbps / max_val) * bar_len), bar_len)
+                                    bar = '█' * filled + '-' * (bar_len - filled)
+                                    
+                                    print(f"[{sec_val:>5}s] [{bar}] {mbps:8.2f} Mbps")
+                                    
+                        proc.wait()
+                        print("="*68 + "\n")
+                        
+                        dir_text = "".join(direction_log)
+                        if proc.returncode != 0:
+                            logging.warning(f"{t_name} Speed Test returned code {proc.returncode}")
+                            
+                        if t_name == "UPLOAD":
+                            sender_matches = re.findall(r'\[SUM\].*?\s+(\d+(?:\.\d+)?)\s+([KMG])bits/sec\s+sender', dir_text)
+                            if sender_matches:
+                                v, u = float(sender_matches[-1][0]), sender_matches[-1][1]
+                                overall_up = v * 1000 if u == 'G' else (v if u == 'M' else v / 1000)
                         else:
-                            res = res.replace("[SPEED_TEST_SUCCESS]", "[SPEED_TEST_FAILED]")
-                            logging.warning(f"Speed test throughput below target {criteria} Mbps.")
+                            recv_matches = re.findall(r'\[SUM\].*?\s+(\d+(?:\.\d+)?)\s+([KMG])bits/sec\s+receiver', dir_text)
+                            if recv_matches:
+                                v, u = float(recv_matches[-1][0]), recv_matches[-1][1]
+                                overall_dl = v * 1000 if u == 'G' else (v if u == 'M' else v / 1000)
+                                
+                        time.sleep(2) 
+                        
+                    out_text = "".join(full_log)
+                    
+                    if overall_up >= criteria and overall_dl >= criteria:
+                        res = f"[SPEED_TEST_SUCCESS] Upload: {overall_up:.2f} Mbps, Download: {overall_dl:.2f} Mbps\n{out_text}"
+                        logging.info(f"Speed test passed criteria! (Up: {overall_up:.2f} Mbps, Down: {overall_dl:.2f} Mbps)")
+                    else:
+                        res = f"[SPEED_TEST_FAILED] Upload: {overall_up:.2f} Mbps, Download: {overall_dl:.2f} Mbps (Target: {criteria} Mbps)\n{out_text}"
+                        logging.warning(f"Speed test throughput below target {criteria} Mbps.")
                 
                 except FileNotFoundError:
                     res = "[SPEED_TEST_FAILED] iperf3 executable not found in system PATH."
@@ -679,31 +739,72 @@ class TestAutomationEngine:
                 if "^" in res_initial or "invalid token" in res_initial.lower() or "error" in res_initial.lower():
                     res = res_initial 
                 else:
-                    logging.info("Command sent. Waiting 10 seconds for ONT to drop offline...")
-                    time.sleep(10)
+                    logging.info("Reboot command sent. Forcing OLT disconnection to allow PC NIC failover (Wait 5s)...")
+                    time.sleep(5)
+                    self.olt.disconnect()
                     
-                    logging.info("Polling until ONT comes back online (Max 5 mins)...")
-                    start_t = time.time()
-                    reboot_success = False
-                    verify_cmd = f"show equipment ont status channel-pair {self.chanpair}"
+                    logging.info("Attempting to reconnect to OLT and waiting for ONT recovery (Max 5 mins)...")
+                    start_wait_t = time.time()
+                    reconnected = False
                     
-                    for attempt in range(60):
-                        out = self.olt.send_command(verify_cmd, timeout=5)
-                        match_line = [line for line in out.split('\n') if self.serial_formatted.lower() in line.lower() and self.port_full.lower() in line.lower()]
-                        if match_line:
-                            tokens = match_line[0].strip().lower().split()
-                            if "up" in tokens:
-                                reboot_success = True
-                                break
+                    while time.time() - start_wait_t < 300:
+                        if self.olt.connect():
+                            reconnected = True
+                            logging.info("Successfully reconnected to OLT!")
+                            break
                         time.sleep(5)
                         
-                    elapsed = time.time() - start_t
-                    if reboot_success:
-                        res = f"[REBOOT_SUCCESS] ONT online after {elapsed:.1f} seconds.\n" + res_initial
-                        logging.info(f"ONT Rebooted and Online in {elapsed:.1f} seconds!")
+                    if not reconnected:
+                        res = f"[REBOOT_FAILED] Could not reconnect to OLT after 5 minutes.\n[Reboot Trigger]\n{res_initial}"
+                        logging.error("OLT Reconnection timeout reached!")
                     else:
-                        res = f"[REBOOT_FAILED] ONT did not come online within timeout.\n" + res_initial
-                        logging.error("Reboot timeout reached!")
+                        alarm_cmd_template = self.db.get_learned_command(self.olt.olt_profile, "Alarm_Check_Cmd")
+                        if not alarm_cmd_template:
+                            alarm_cmd_template = "show equipment ont alarm {port}" 
+                            self.db.save_learned_command(self.olt.olt_profile, "Alarm_Check_Cmd", alarm_cmd_template)
+                            
+                        alarm_cmd = alarm_cmd_template.format(port=self.port_full, chanpair=self.chanpair)
+                        
+                        reboot_success = False
+                        reboot_time_sec = 0.0
+                        last_alarm_out = ""
+                        
+                        log_pattern = re.compile(r'(\d{2}/\d{2}/\d{2}\s+\d{2}:\d{2}:\d{2})\s+major alarm (occurred|cleared).*ONT is inactive', re.IGNORECASE)
+                        
+                        for attempt in range(60):
+                            last_alarm_out = self.olt.send_command(alarm_cmd, timeout=5)
+                            
+                            occurred_time = None
+                            cleared_time = None
+                            
+                            for match in log_pattern.finditer(last_alarm_out):
+                                timestamp_str, action = match.groups()
+                                try:
+                                    dt_obj = datetime.strptime(timestamp_str, "%y/%m/%d %H:%M:%S")
+                                    if action.lower() == "occurred":
+                                        occurred_time = dt_obj
+                                    elif action.lower() == "cleared":
+                                        cleared_time = dt_obj
+                                except ValueError:
+                                    continue
+                                    
+                            if occurred_time and cleared_time and cleared_time > occurred_time:
+                                reboot_time_sec = (cleared_time - occurred_time).total_seconds()
+                                reboot_success = True
+                                break
+                            elif cleared_time and not occurred_time:
+                                reboot_success = True
+                                reboot_time_sec = time.time() - start_wait_t
+                                break
+                                
+                            time.sleep(5)
+                            
+                        if reboot_success:
+                            res = f"[REBOOT_SUCCESS] ONT recovery confirmed via Alarm Log. True Reboot Duration: {reboot_time_sec:.1f} seconds.\n[Reboot Trigger]\n{res_initial}\n[Final Alarm Log]\n{last_alarm_out}"
+                            logging.info(f"ONT Rebooted and Recovery Detected! Actual Reboot Time: {reboot_time_sec:.1f} seconds.")
+                        else:
+                            res = f"[REBOOT_FAILED] ONT did not recover within timeout (Alarm 'cleared' not found).\n[Reboot Trigger]\n{res_initial}\n[Last Alarm Log]\n{last_alarm_out}"
+                            logging.error("Reboot timeout reached!")
 
             else:
                 if ';' in sn['command']:
@@ -717,6 +818,11 @@ class TestAutomationEngine:
                     res = "\n".join(res_lines)
                 else:
                     res = self.olt.send_command(sn['command'])
+                    
+                if sn['type'] == "Software_Info":
+                    match = re.search(r'sw-ver-act\s*:\s*(\S+)', res, re.IGNORECASE)
+                    if match:
+                        self.config['sw_version'] = match.group(1).upper()
             
             # Verify and update DB
             if self._verify(sn['type'], res):
@@ -751,6 +857,12 @@ class TestAutomationEngine:
             return False
             
         res_lower = res.lower()
+        
+        if t_type == "Reboot_Test" and "[REBOOT_SUCCESS]" in res:
+            return True
+        if t_type == "Speed_Test" and "[SPEED_TEST_SUCCESS]" in res:
+            return True
+            
         error_kws = ["invalid command", "invalid token", "unknown command", "bad parameter", "incomplete command"]
         if any(kw in res_lower for kw in error_kws) or "^" in res: 
             return False
@@ -777,12 +889,6 @@ class TestAutomationEngine:
             
         if t_type == "MAC_Status": 
             return bool(re.search(r'([0-9A-F]{2}:){5}[0-9A-F]{2}', res, re.I))
-            
-        if t_type == "Reboot_Test":
-            return "[REBOOT_SUCCESS]" in res
-            
-        if t_type == "Speed_Test":
-            return "[SPEED_TEST_SUCCESS]" in res
 
         return True
 
@@ -859,25 +965,84 @@ if __name__ == "__main__":
                 selected_ont = onts_list[sel_input-1]
                 config['ont_serial'] = selected_ont['serial']
                 config['chanpair'] = selected_ont['chanpair'] if selected_ont['chanpair'] != "unknown" else input(f"Enter Channel-Pair: ").strip()
-                config['pon'] = input("Target PON (e.g., ng2:5/1): ").strip()
-                config['ont_id'] = input("Target ONT ID (e.g., 10): ").strip()
+                
+                def_pon = ""
+                def_ont_id = "1"
+                
+                if config['chanpair'] and config['chanpair'] != "unknown":
+                    parts = config['chanpair'].split('/')
+                    if len(parts) >= 4:
+                        def_pon = f"ng2:{parts[3]}/{parts[2]}"
+                        
+                    logging.info(f"Scanning channel-pair {config['chanpair']} to find an available ONT ID...")
+                    out = olt.send_command(f"show equipment ont status channel-pair {config['chanpair']}", timeout=5)
+                    used_ids = set()
+                    
+                    print(f"\n[ Currently Provisioned ONTs on Channel-Pair {config['chanpair']} ]\n{out}\n")
+                    
+                    matches = re.findall(r'([a-zA-Z0-9:-]+(?:/\d+)+)\s+([A-Za-z]{4}:?[A-Fa-f0-9]{8})', out)
+                    for port_str, serial in matches:
+                        last_digit = port_str.split('/')[-1]
+                        if last_digit.isdigit():
+                            used_ids.add(int(last_digit))
+                            
+                    for i in range(1, 129):
+                        if i not in used_ids:
+                            def_ont_id = str(i)
+                            break
+                
+                while True:
+                    pon_input = input(f"Target PON [{def_pon}]: ").strip() or def_pon
+                    if re.match(r'^(?:[a-zA-Z0-9]+:)?\d+(?:/\d+)+$', pon_input):
+                        config['pon'] = pon_input
+                        break
+                    print("  [!] Invalid format! Please enter a valid PON port (e.g., ng2:3/1 or 1/1/1).")
+                    
+                while True:
+                    ont_id_input = input(f"Target ONT ID [{def_ont_id}]: ").strip() or def_ont_id
+                    if ont_id_input.isdigit():
+                        config['ont_id'] = ont_id_input
+                        break
+                    print("  [!] Invalid format! ONT ID must be a number (e.g., 1, 10).")
                 break
                 
             elif choice == "2":
-                find_cmd = olt._get_safe_find_cmd(db)
-                out = olt.send_command(find_cmd)
-                print(f"\n[ PROVISIONED ONTs OUTPUT ]\n{out}\n")
-                del_target = input("Enter PORT or SERIAL to delete or 'cancel': ").strip()
-                if del_target.lower() == 'cancel': continue
-                
-                target_port = del_target
-                if '/' not in del_target and ':' not in del_target:
-                    matches = re.findall(r'(\d+(?:/\d+)+)\s+([a-zA-Z0-9:-]+(?:/\d+)+)\s+([A-Za-z]{4}:?[A-Fa-f0-9]{8})', out)
+                active_onts = []
+                logging.info("Scanning Channels 1/1/1/1 to 1/1/1/8 for Active ONTs (Oper UP)...")
+                for i in range(1, 9):
+                    out = olt.send_command(f"show equipment ont status channel-pair 1/1/1/{i}", timeout=5)
+                    matches = re.findall(r'(\d+(?:/\d+)+)\s+([a-zA-Z0-9:-]+(?:/\d+)+)\s+([A-Za-z]{4}:?[A-Fa-f0-9]{8})\s+(\S+)\s+(\S+)', out)
                     for m in matches:
-                        if del_target.lower() in m[2].lower().replace(':', ''):
-                            target_port = m[1]
+                        if m[4].lower() == 'up': 
+                            active_onts.append({'chanpair': m[0], 'port': m[1], 'serial': m[2].replace(':', '')})
+                
+                if active_onts:
+                    print("\n[ Active Provisioned ONTs (Oper UP) ]")
+                    for i, ont in enumerate(active_onts, 1): 
+                        print(f"  [{i}] Serial: {ont['serial']} | Port: {ont['port']} | ChanPair: {ont['chanpair']}")
+                else:
+                    print("\nNo active ONTs (Oper UP) found in 1/1/1/1 ~ 1/1/1/8.")
+
+                del_target = input("\nSelect Index or enter PORT manually (or 'cancel'): ").strip()
+                if del_target.lower() == 'cancel' or not del_target: 
+                    continue
+                    
+                target_port = del_target
+                if del_target.isdigit() and 1 <= int(del_target) <= len(active_onts):
+                    target_port = active_onts[int(del_target)-1]['port']
+                    print(f"-> Selected Serial {active_onts[int(del_target)-1]['serial']} on Port {target_port}.")
+                elif '/' not in del_target and ':' not in del_target:
+                    found = False
+                    for ont in active_onts:
+                        if del_target.lower() == ont['serial'].lower():
+                            target_port = ont['port']
+                            found = True
+                            print(f"-> Found Serial {ont['serial']} residing on Port {target_port}.")
                             break
-                        
+                    if not found:
+                        print("-> Could not find that Serial in the active list. If it is offline, please enter the full PORT manually.")
+                        continue
+
                 olt._delete_ont_by_port(target_port, db)
                 time.sleep(2)
                 continue
@@ -900,9 +1065,22 @@ if __name__ == "__main__":
                         def_pon, def_ont_id = selected['port'].rsplit('/', 1)
 
                 config['ont_serial'] = input(f"Enter Serial [{def_serial}]: ").strip() or def_serial
-                config['pon'] = input(f"Target PON [{def_pon}]: ").strip() or def_pon
-                config['ont_id'] = input(f"Target ONT ID [{def_ont_id}]: ").strip() or def_ont_id
                 config['chanpair'] = input(f"Enter Channel-Pair [{def_chanpair}]: ").strip() or def_chanpair
+                
+                while True:
+                    pon_input = input(f"Target PON [{def_pon}]: ").strip() or def_pon
+                    if re.match(r'^(?:[a-zA-Z0-9]+:)?\d+(?:/\d+)+$', pon_input):
+                        config['pon'] = pon_input
+                        break
+                    print("  [!] Invalid format! Please enter a valid PON port (e.g., ng2:3/1 or 1/1/1).")
+                    
+                while True:
+                    ont_id_input = input(f"Target ONT ID [{def_ont_id}]: ").strip() or def_ont_id
+                    if ont_id_input.isdigit():
+                        config['ont_id'] = ont_id_input
+                        break
+                    print("  [!] Invalid format! ONT ID must be a number (e.g., 1, 10).")
+                
                 skip_provisioning = True
                 break
                 

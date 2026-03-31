@@ -4,16 +4,16 @@
     "password": "ans#150",
     "protocol": "telnet",
     "ont_serial": "ROCNA0000010",
-    "pon": "ng2:3/1",
-    "ont_id": "1",
     "chanpair": "1/1/1/3",
-    "iperf_server": "103.175.200.43",
-    "iperf_port": "5201",
-    "speed_duration": "30",
-    "speed_pass_mbps": "8000",
+    "pon": "ng2:3/1",
+    "ont_id": "53",
     "ont_type": "sfu",
     "lan_ports": "1",
     "max_mac": "16",
     "bw_profile": "NG2DATABWUP10000",
-    "vlan_id": "1001"
+    "vlan_id": "1001",
+    "iperf_server": "103.175.200.43",
+    "iperf_port": "5201",
+    "speed_duration": "30",
+    "speed_pass_mbps": "8000"
 }
