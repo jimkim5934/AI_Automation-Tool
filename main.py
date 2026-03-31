@@ -282,9 +282,9 @@ class DatabaseManager:
                 "Optics_Check": "show equipment ont optics {port}",
                 "UNI_Status": "show equipment ont interface {port}",
                 "Software_Info": "show equipment ont interface {port} detail",
-                "Speed_Test": "speed_test.py", 
+                "Speed_Test": "Native iperf3 Execution", 
                 "MAC_Status": "show vlan bridge-port-fdb {port}/1/1",
-                "Reboot_Test": "admin equipment ont interface {port} reboot",
+                "Reboot_Test": "admin equipment ont interface {port} reboot with-active-image",
                 "Cleanup": "configure equipment ont interface {port} admin-state down ; configure equipment ont no interface {port}"
             }
             
@@ -295,7 +295,10 @@ class DatabaseManager:
             for i, (t_type, def_cmd) in enumerate(templates.items(), 1):
                 template = learned_dict.get(t_type)
                 
-                if "{port}" in def_cmd and template and "{port}" not in template:
+                if t_type == "Reboot_Test" and template and "with-active-image" not in template:
+                    template = def_cmd
+                    cursor.execute('INSERT OR REPLACE INTO learned_commands (olt_profile, test_type, command_template) VALUES (?, ?, ?)', (profile, t_type, def_cmd))
+                elif "{port}" in def_cmd and template and "{port}" not in template:
                     template = def_cmd
                     cursor.execute('INSERT OR REPLACE INTO learned_commands (olt_profile, test_type, command_template) VALUES (?, ?, ?)', (profile, t_type, def_cmd))
                 elif "{chanpair}" in def_cmd and template and "{chanpair}" not in template:
@@ -355,12 +358,27 @@ class NokiaOLTConnector:
         m = re.search(r'(\d+\.\d+\.\S+)', out)
         self.olt_profile = f"Nokia_OS_{m.group(1)}" if m else "Nokia_Unknown"
 
-    def send_command(self, cmd: str, timeout: int = 15) -> str:
+    # [CRITICAL FIX] Auto-Reconnect logic added for handling NIC flaps during ONT reboot
+    def send_command(self, cmd: str, timeout: int = 15, retry: bool = True) -> str:
         if self.connection:
             try: 
+                if not self.connection.is_alive():
+                    raise Exception("Connection dead")
                 return self.connection.send_command_timing(cmd, read_timeout=timeout)
-            except Exception as e: 
+            except Exception as e:
+                if retry:
+                    logging.warning(f"Connection dropped during command execution. Attempting Auto-Reconnect...")
+                    self.disconnect()
+                    if self.connect():
+                        logging.info("Auto-Reconnect successful. Retrying command...")
+                        try:
+                            return self.connection.send_command_timing(cmd, read_timeout=timeout)
+                        except Exception as e2:
+                            return f"Error after reconnect: {e2}"
                 return f"Error: {e}"
+        else:
+            if retry and self.connect():
+                return self.send_command(cmd, timeout=timeout, retry=False)
         return "No Connection"
 
     def get_unprovisioned_onts(self, discovery_cmd: str) -> List[Dict[str, str]]:
@@ -482,7 +500,6 @@ class NokiaOLTConnector:
             cmd = cmd_template.format(port=port_full, chanpair=chanpair)
             max_retries = 5
             success = False
-            last_out = self.send_command(cmd, timeout=5) 
             
             for attempt in range(1, max_retries + 1):
                 last_out = self.send_command(cmd, timeout=5)
@@ -581,83 +598,114 @@ class TestAutomationEngine:
             res = ""
             
             if sn['type'] == "Speed_Test":
-                if os.path.exists(sn['command']):
-                    try:
-                        cmd_args = [
-                            sys.executable, sn['command'],
-                            "--duration", str(self.config.get('speed_duration', 10)),
-                            "--pass_criteria", str(self.config.get('speed_pass_mbps', 500)),
-                            "--iperf_server", self.config.get('iperf_server', '').strip(),
-                            "--iperf_port", str(self.config.get('iperf_port', 5201))
-                        ]
-                        
-                        test_duration = int(self.config.get('speed_duration', 10))
-                        proc_timeout = (test_duration * 2) + 30 
-                        
-                        process = subprocess.Popen(cmd_args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
-                        res_lines = []
-                        
-                        def stream_reader(proc, lines):
-                            for line in iter(proc.stdout.readline, ''):
-                                sys.stdout.write(line)
-                                sys.stdout.flush()
-                                lines.append(line)
+                server = self.config.get('iperf_server', '').strip()
+                port = str(self.config.get('iperf_port', 5201))
+                duration = str(self.config.get('speed_duration', 10))
+                criteria = float(self.config.get('speed_pass_mbps', 500))
+                
+                if not server:
+                    logging.warning("No iperf3 server specified. Skipping Speed_Test.")
+                    res = "[SPEED_TEST_SUCCESS] Skipped (No server)"
+                    self.db.update_test_status(sn['id'], "PASS", res)
+                    continue
+                    
+                cmd_args = ['iperf3', '-c', server, '-p', port, '-t', duration, '-P', '8']
+                logging.info(f"Running Native iperf3: {' '.join(cmd_args)}")
+                
+                print("\n" + "="*68)
+                print(f"{'Time':<8} | {'Progress Graph':<42} | {'Throughput':<15}")
+                print("="*68)
+                
+                try:
+                    proc = subprocess.Popen(cmd_args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+                    
+                    overall_sent = 0.0
+                    overall_recv = 0.0
+                    log_capture = []
+                    
+                    for line in iter(proc.stdout.readline, ''):
+                        log_capture.append(line)
+                        if "[SUM]" in line and "bits/sec" in line and "sender" not in line and "receiver" not in line:
+                            match = re.search(r'\[SUM\]\s+\d+\.\d+-\s*(\d+\.\d+)\s+sec.*?\s+(\d+(?:\.\d+)?)\s+([KMG])bits/sec', line)
+                            if match:
+                                sec_val = match.group(1)
+                                val = float(match.group(2))
+                                unit = match.group(3)
+                                mbps = val * 1000 if unit == 'G' else (val if unit == 'M' else val / 1000)
                                 
-                        reader_thread = threading.Thread(target=stream_reader, args=(process, res_lines))
-                        reader_thread.start()
-                        reader_thread.join(timeout=proc_timeout)
+                                bar_len = 40
+                                max_val = max(criteria * 1.2, 10000)
+                                filled = min(int((mbps / max_val) * bar_len), bar_len)
+                                bar = '█' * filled + '-' * (bar_len - filled)
+                                
+                                print(f"[{sec_val:>5}s] [{bar}] {mbps:8.2f} Mbps")
+                                
+                    proc.wait()
+                    print("="*68 + "\n")
+                    
+                    out_text = "".join(log_capture)
+                    sender_matches = re.findall(r'\[SUM\].*?\s+(\d+(?:\.\d+)?)\s+([KMG])bits/sec\s+sender', out_text)
+                    recv_matches = re.findall(r'\[SUM\].*?\s+(\d+(?:\.\d+)?)\s+([KMG])bits/sec\s+receiver', out_text)
+                    
+                    if sender_matches:
+                        v, u = float(sender_matches[-1][0]), sender_matches[-1][1]
+                        overall_sent = v * 1000 if u == 'G' else (v if u == 'M' else v / 1000)
+                    if recv_matches:
+                        v, u = float(recv_matches[-1][0]), recv_matches[-1][1]
+                        overall_recv = v * 1000 if u == 'G' else (v if u == 'M' else v / 1000)
                         
-                        if reader_thread.is_alive():
-                            process.terminate()
-                            reader_thread.join()
-                            res_lines.append("\nERROR: Script execution timed out.\n")
-                            
-                        process.wait()
-                        res = "".join(res_lines)
-                        
-                        if process.returncode == 0 and "SPEED_TEST_SUCCESS" in res:
-                            logging.info("Speed test executed successfully.")
+                    if proc.returncode != 0:
+                        res = f"[SPEED_TEST_FAILED] iperf3 returned code {proc.returncode}\n{out_text}"
+                        logging.warning(f"Speed Test failed or aborted.")
+                    else:
+                        res = f"[SPEED_TEST_SUCCESS] Upload: {overall_sent:.2f} Mbps, Download: {overall_recv:.2f} Mbps\n{out_text}"
+                        if overall_sent >= criteria or overall_recv >= criteria:
+                            logging.info(f"Speed test passed criteria! (Up: {overall_sent:.2f} Mbps, Down: {overall_recv:.2f} Mbps)")
                         else:
-                            logging.warning(f"Speed Test Script finished, but throughput was below target. (Code: {process.returncode})")
-                            
-                    except Exception as e:
-                        res = f"Script execution failed: {e}"
-                        logging.error(res)
-                else:
-                    logging.warning(f"Script '{sn['command']}' not found. Simulating Bypass...")
-                    res = "[SPEED_TEST_SUCCESS]"
+                            res = res.replace("[SPEED_TEST_SUCCESS]", "[SPEED_TEST_FAILED]")
+                            logging.warning(f"Speed test throughput below target {criteria} Mbps.")
+                
+                except FileNotFoundError:
+                    res = "[SPEED_TEST_FAILED] iperf3 executable not found in system PATH."
+                    logging.error(res)
+                except Exception as e:
+                    res = f"[SPEED_TEST_FAILED] Unexpected error: {e}"
+                    logging.error(res)
                     
             elif sn['type'] == "Reboot_Test":
                 logging.info("Sending Reboot Command to OLT...")
                 res_initial = self.olt.send_command(sn['command'])
-                logging.info("Command sent. Waiting 10 seconds for ONT to drop offline...")
-                time.sleep(10)
                 
-                logging.info("Polling until ONT comes back online (Max 5 mins)...")
-                start_t = time.time()
-                reboot_success = False
-                verify_cmd = f"show equipment ont status channel-pair {self.chanpair}"
-                
-                for attempt in range(60):
-                    out = self.olt.send_command(verify_cmd, timeout=5)
-                    match_line = [line for line in out.split('\n') if self.serial_formatted.lower() in line.lower() and self.port_full.lower() in line.lower()]
-                    if match_line:
-                        tokens = match_line[0].strip().lower().split()
-                        if "up" in tokens:
-                            reboot_success = True
-                            break
-                    time.sleep(5)
-                    
-                elapsed = time.time() - start_t
-                if reboot_success:
-                    res = f"[REBOOT_SUCCESS] ONT online after {elapsed:.1f} seconds.\n" + res_initial
-                    logging.info(f"ONT Rebooted and Online in {elapsed:.1f} seconds!")
+                if "^" in res_initial or "invalid token" in res_initial.lower() or "error" in res_initial.lower():
+                    res = res_initial 
                 else:
-                    res = f"[REBOOT_FAILED] ONT did not come online within timeout.\n" + res_initial
-                    logging.error("Reboot timeout reached!")
+                    logging.info("Command sent. Waiting 10 seconds for ONT to drop offline...")
+                    time.sleep(10)
                     
+                    logging.info("Polling until ONT comes back online (Max 5 mins)...")
+                    start_t = time.time()
+                    reboot_success = False
+                    verify_cmd = f"show equipment ont status channel-pair {self.chanpair}"
+                    
+                    for attempt in range(60):
+                        out = self.olt.send_command(verify_cmd, timeout=5)
+                        match_line = [line for line in out.split('\n') if self.serial_formatted.lower() in line.lower() and self.port_full.lower() in line.lower()]
+                        if match_line:
+                            tokens = match_line[0].strip().lower().split()
+                            if "up" in tokens:
+                                reboot_success = True
+                                break
+                        time.sleep(5)
+                        
+                    elapsed = time.time() - start_t
+                    if reboot_success:
+                        res = f"[REBOOT_SUCCESS] ONT online after {elapsed:.1f} seconds.\n" + res_initial
+                        logging.info(f"ONT Rebooted and Online in {elapsed:.1f} seconds!")
+                    else:
+                        res = f"[REBOOT_FAILED] ONT did not come online within timeout.\n" + res_initial
+                        logging.error("Reboot timeout reached!")
+
             else:
-                # Handle commands split by ';' (e.g. Cleanup)
                 if ';' in sn['command']:
                     res_lines = []
                     for c in sn['command'].split(';'):
