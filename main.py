@@ -75,6 +75,7 @@ def generate_professional_excel_report(serial: str, db, config: Dict):
             ("Target Serial", serial),
             ("Target PON / ID", f"{config.get('pon', 'N/A')} / {config.get('ont_id', 'N/A')}"),
             ("Software Version", config.get('sw_version', 'Unknown')),
+            ("VLAN Mode", config.get('vlan_mode', 'untagged').capitalize()),
             ("Test Date", datetime.now().strftime('%Y-%m-%d %H:%M:%S')),
             ("Total Tests", total),
             ("PASS", c_pass),
@@ -166,7 +167,6 @@ def generate_professional_excel_report(serial: str, db, config: Dict):
                             match = re.search(r'\[SUM\]\s+\d+\.\d+-\s*(\d+\.\d+)\s+sec.*?\s+(\d+(?:\.\d+)?)\s+([KMG])bits/sec', clean_line)
                             if match:
                                 end_time_float = float(match.group(1))
-                                # [CRITICAL FIX] Align times to exact integers so Up/Down share the exact same X-axis keys
                                 t_sec = int(round(end_time_float))
                                 val = float(match.group(2))
                                 unit = match.group(3)
@@ -189,7 +189,6 @@ def generate_professional_excel_report(serial: str, db, config: Dict):
             r_idx = 2
             if all_times:
                 max_time = max(all_times)
-                # Ensure no None values by carrying over the last recorded speed (forward-fill)
                 last_up = None
                 last_dl = None
                 
@@ -212,15 +211,16 @@ def generate_professional_excel_report(serial: str, db, config: Dict):
             chart.width = 20
             chart.height = 10
             
-            # Select columns 5 (Upload) and 6 (Download) for Y-axis
+            chart.x_axis.tickLblPos = "low"
+            chart.y_axis.tickLblPos = "low"
+            chart.dispBlanksAs = "span" 
+            
             data = Reference(ws_log, min_col=5, max_col=6, min_row=1, max_row=r_idx-1)
-            # Select column 4 (Time) for X-axis
             cats = Reference(ws_log, min_col=4, min_row=2, max_row=r_idx-1)
             
             chart.add_data(data, titles_from_data=True)
             chart.set_categories(cats)
             
-            # [CRITICAL FIX] Add circle markers (dots connected by lines)
             for s in chart.series:
                 s.marker = Marker(symbol='circle', size=5)
             
@@ -324,7 +324,7 @@ class DatabaseManager:
                 "Registration_Check": "show equipment ont status channel-pair {chanpair}", 
                 "Reboot_Test": "admin equipment ont interface {port} reboot with-active-image",
                 "Optics_Check": "show equipment ont optics {port}",
-                "UNI_Status": "show equipment ont interface {port}",
+                "UNI_Status": "show ethernet ont operational-data {port}/1/1",
                 "Software_Info": "show equipment ont interface {port} detail",
                 "Speed_Test": "Native iperf3 Execution", 
                 "MAC_Status": "show vlan bridge-port-fdb {port}/1/1",
@@ -338,7 +338,11 @@ class DatabaseManager:
             for i, (t_type, def_cmd) in enumerate(templates.items(), 1):
                 template = learned_dict.get(t_type)
                 
+                # Auto-Heal incomplete or incorrect templates learned from manual input
                 if t_type == "Reboot_Test" and template and "with-active-image" not in template:
+                    template = def_cmd
+                    cursor.execute('INSERT OR REPLACE INTO learned_commands (olt_profile, test_type, command_template) VALUES (?, ?, ?)', (profile, t_type, def_cmd))
+                elif t_type == "UNI_Status" and template and "operational-data" not in template:
                     template = def_cmd
                     cursor.execute('INSERT OR REPLACE INTO learned_commands (olt_profile, test_type, command_template) VALUES (?, ?, ?)', (profile, t_type, def_cmd))
                 elif "{port}" in def_cmd and template and "{port}" not in template:
@@ -572,32 +576,51 @@ class NokiaOLTConnector:
 
     def provision_service_ont(self, config: Dict, db: DatabaseManager) -> bool:
         port_full = f"{config['pon']}/{config['ont_id']}"
-        prov_key = f"Provisioning_Service_{config['ont_type'].upper()}"
+        vlan_mode = config.get('vlan_mode', 'untagged').lower()
+        prov_key = f"Provisioning_Service_{config['ont_type'].upper()}_{vlan_mode.upper()}"
+        
         learned_cmds = db.get_learned_command(self.olt_profile, prov_key)
         
         if learned_cmds and "vlan-id" not in learned_cmds.lower():
-            logging.warning("Learned provisioning command seems incomplete. Reverting to default sequence.")
+            logging.warning(f"Learned provisioning command for {vlan_mode} seems incomplete. Reverting to default sequence.")
             learned_cmds = None
             
         if learned_cmds:
             cmd_templates = [c.strip() for c in learned_cmds.split(';') if c.strip()]
         else:
+            base_sfu = [
+                "configure qos interface uni:{port}/1/1 queue [0...7] shaper-profile name:StrictPriority",
+                "configure qos interface uni:{port}/1/1 upstream-queue [0...7] bandwidth-profile name:{bw_profile} bandwidth-sharing uni-sharing",
+                "configure bridge port {port}/1/1 max-unicast-mac {max_mac}"
+            ]
+            base_hgu = [
+                "configure bridge port {port}/14/1 max-unicast-mac {max_mac}"
+            ]
+            
             if config['ont_type'] == 'sfu':
-                cmd_templates = [
-                    "configure qos interface uni:{port}/1/1 queue [0...7] shaper-profile name:StrictPriority",
-                    "configure qos interface uni:{port}/1/1 upstream-queue [0...7] bandwidth-profile name:{bw_profile} bandwidth-sharing uni-sharing",
-                    "configure bridge port {port}/1/1 max-unicast-mac {max_mac}",
-                    "configure bridge port {port}/1/1 vlan-id {vlan_id}",
-                    "configure bridge port {port}/1/1 pvid {vlan_id}"
-                ]
+                cmd_templates = base_sfu
+                if vlan_mode == 'untagged':
+                    cmd_templates.extend([
+                        "configure bridge port {port}/1/1 vlan-id {vlan_id} usacceptframetype untagged",
+                        "configure bridge port {port}/1/1 pvid {vlan_id}"
+                    ])
+                elif vlan_mode == 'tagged':
+                    cmd_templates.append("configure bridge port {port}/1/1 vlan-id {vlan_id} tag single-tagged l2fwder-vlan {vlan_id} vlan-scope local")
+                elif vlan_mode == 'translation':
+                    cmd_templates.append("configure bridge port {port}/1/1 vlan-id {c_vlan} tag single-tagged l2fwder-vlan {vlan_id} vlan-scope local")
             else:
-                cmd_templates = [
-                    "configure bridge port {port}/14/1 max-unicast-mac {max_mac}",
-                    "configure bridge port {port}/14/1 vlan-id {vlan_id}",
-                    "configure bridge port {port}/14/1 pvid {vlan_id}"
-                ]
+                cmd_templates = base_hgu
+                if vlan_mode == 'untagged':
+                    cmd_templates.extend([
+                        "configure bridge port {port}/14/1 vlan-id {vlan_id} usacceptframetype untagged",
+                        "configure bridge port {port}/14/1 pvid {vlan_id}"
+                    ])
+                elif vlan_mode == 'tagged':
+                    cmd_templates.append("configure bridge port {port}/14/1 vlan-id {vlan_id} tag single-tagged l2fwder-vlan {vlan_id} vlan-scope local")
+                elif vlan_mode == 'translation':
+                    cmd_templates.append("configure bridge port {port}/14/1 vlan-id {c_vlan} tag single-tagged l2fwder-vlan {vlan_id} vlan-scope local")
 
-        logging.info(f"--- [STEP 3] Initiating Service Provisioning on {port_full} ---")
+        logging.info(f"--- [STEP 3] Initiating Service Provisioning ({vlan_mode.upper()}) on {port_full} ---")
         error_kws = ["invalid command", "invalid token", "unknown command", "bad parameter", "incomplete command"]
         
         while True:
@@ -605,7 +628,8 @@ class NokiaOLTConnector:
             for template in cmd_templates:
                 cmd = template.format(
                     port=port_full, bw_profile=config.get('bw_profile', ''),
-                    max_mac=config.get('max_mac', '128'), vlan_id=config.get('vlan_id', '1001')
+                    max_mac=config.get('max_mac', '128'), vlan_id=config.get('vlan_id', '1001'),
+                    c_vlan=config.get('c_vlan', '10')
                 )
                 
                 out = self.send_command(cmd, timeout=10)
@@ -887,6 +911,11 @@ class TestAutomationEngine:
                 if val not in ["sw-ver-psv", "vendor-id", "unknown"]: return True
             return False
             
+        if t_type == "UNI_Status":
+            has_link = "link-status" in res_lower and "up" in res_lower
+            has_speed = "config-indicator" in res_lower and any(s in res_lower for s in ['10g', '1g', '100m', '10m'])
+            return has_link and has_speed
+            
         if t_type == "MAC_Status": 
             return bool(re.search(r'([0-9A-F]{2}:){5}[0-9A-F]{2}', res, re.I))
 
@@ -1100,6 +1129,15 @@ if __name__ == "__main__":
                 config['bw_profile'] = input("Enter Bandwidth Profile Name [NG2DATABWUP10000]: ").strip() or "NG2DATABWUP10000"
             net_input = input("Network Environment (real/traffic) [default: real]: ").strip().lower() or 'real'
             config['vlan_id'] = "1001" if net_input == 'real' else "4000"
+            
+            vlan_mode_input = input("VLAN Mode [1] Untagged [2] Tagged [3] Translation [default: 1]: ").strip()
+            if vlan_mode_input == '2':
+                config['vlan_mode'] = 'tagged'
+            elif vlan_mode_input == '3':
+                config['vlan_mode'] = 'translation'
+                config['c_vlan'] = input("Enter Customer VLAN ID (C-VLAN) [default: 10]: ").strip() or "10"
+            else:
+                config['vlan_mode'] = 'untagged'
 
         speed_setup = input("Configure Speed Test parameters? (y/n) [default: y]: ").strip().lower()
         if speed_setup != 'n':

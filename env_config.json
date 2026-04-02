@@ -3,7 +3,7 @@
     "username": "isadmin",
     "password": "ans#150",
     "protocol": "telnet",
-    "ont_serial": "ROCNA0000010",
+    "ont_serial": "HUMA23084463",
     "pon": "ng2:3/1",
     "ont_id": "1",
     "chanpair": "1/1/1/3",
@@ -13,7 +13,8 @@
     "speed_pass_mbps": "8000",
     "ont_type": "sfu",
     "lan_ports": "1",
-    "max_mac": "16",
+    "max_mac": "128",
     "bw_profile": "NG2DATABWUP10000",
-    "vlan_id": "1001"
+    "vlan_id": "1001",
+    "vlan_mode": "tagged"
 }
