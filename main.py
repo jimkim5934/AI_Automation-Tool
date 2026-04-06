@@ -882,10 +882,11 @@ class TestAutomationEngine:
             
         res_lower = res.lower()
         
-        if t_type == "Reboot_Test" and "[REBOOT_SUCCESS]" in res:
-            return True
-        if t_type == "Speed_Test" and "[SPEED_TEST_SUCCESS]" in res:
-            return True
+        # [CRITICAL FIX] Strictly return the boolean check for explicit tags to avoid fallthrough
+        if t_type == "Reboot_Test":
+            return "[REBOOT_SUCCESS]" in res
+        if t_type == "Speed_Test":
+            return "[SPEED_TEST_SUCCESS]" in res
             
         error_kws = ["invalid command", "invalid token", "unknown command", "bad parameter", "incomplete command"]
         if any(kw in res_lower for kw in error_kws) or "^" in res: 
@@ -893,13 +894,11 @@ class TestAutomationEngine:
             
         if t_type == "ONT_Discovery_Check":
             serial_clean = self.serial.replace(":", "").lower()
-            if serial_clean in res_lower.replace(":", ""): return True
-            return False
+            return serial_clean in res_lower.replace(":", "")
 
         if t_type == "Registration_Check":
             serial_clean = self.serial.replace(":", "").lower()
-            if "pref-ranged" in res_lower and serial_clean in res_lower.replace(":", ""): return True
-            return False
+            return "pref-ranged" in res_lower and serial_clean in res_lower.replace(":", "")
             
         if t_type == "Optics_Check": 
             return "rx-signal" in res_lower and "count : 0" not in res_lower
@@ -908,7 +907,7 @@ class TestAutomationEngine:
             match = re.search(r'sw-ver-act\s*:\s*(\S+)', res_lower)
             if match:
                 val = match.group(1)
-                if val not in ["sw-ver-psv", "vendor-id", "unknown"]: return True
+                return val not in ["sw-ver-psv", "vendor-id", "unknown"]
             return False
             
         if t_type == "UNI_Status":
