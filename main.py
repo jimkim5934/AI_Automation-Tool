@@ -105,7 +105,6 @@ def generate_professional_excel_report(serial: str, db, config: Dict):
         center_align = Alignment(horizontal="center", vertical="center")
         thin_border = Border(left=Side(style='thin'), right=Side(style='thin'), top=Side(style='thin'), bottom=Side(style='thin'))
 
-        # SHEET 1: SUMMARY
         ws_sum = wb.active
         ws_sum.title = "Summary"
         
@@ -124,9 +123,8 @@ def generate_professional_excel_report(serial: str, db, config: Dict):
         
         info = [
             ("Target Serial", serial),
-            ("Target PON / ID", f"{config.get('pon', 'N/A')} / {config.get('ont_id', 'N/A')}"),
-            ("OLT Vendor", config.get('olt_vendor', 'Unknown')),
-            ("OLT Model", config.get('olt_model', 'Unknown')),
+            ("OLT Vendor", config.get('global_vendor', 'Unknown')),
+            ("Target PON / ID", f"{config.get('pon', config.get('hw_fsp', 'N/A'))} / {config.get('ont_id', config.get('hw_ont_id', 'N/A'))}"),
             ("ONT SW Version", config.get('sw_version', 'Unknown')),
             ("VLAN Mode", config.get('vlan_mode', 'untagged').capitalize()),
             ("Test Date", datetime.now().strftime('%Y-%m-%d %H:%M:%S')),
@@ -152,9 +150,8 @@ def generate_professional_excel_report(serial: str, db, config: Dict):
             row_idx += 1
             
         ws_sum.column_dimensions['B'].width = 25
-        ws_sum.column_dimensions['C'].width = 30
+        ws_sum.column_dimensions['C'].width = 35
 
-        # SHEET 2: DETAILS
         ws_det = wb.create_sheet(title="Details")
         headers = ["Test Order", "Test Item", "Command / Script", "Result"]
         for col_num, header in enumerate(headers, 1):
@@ -183,7 +180,6 @@ def generate_professional_excel_report(serial: str, db, config: Dict):
         ws_det.column_dimensions['C'].width = 80
         ws_det.column_dimensions['D'].width = 15
 
-        # SHEET 3: LOGS & GRAPH
         ws_log = wb.create_sheet(title="Logs & Graph")
         ws_log.cell(row=1, column=1, value="Test Item").font = bold_font
         ws_log.cell(row=1, column=2, value="Execution Log").font = bold_font
@@ -363,18 +359,18 @@ class DatabaseManager:
 
     def add_initial_test_cases(self, config: Dict, profile: str):
         serial = config['ont_serial']
-        pon = config['pon']
-        ont_id = config['ont_id']
-        chanpair = config.get('chanpair', '')
-        port_full = f"{pon}/{ont_id}"
-        vendor_id = serial[:4]
-        sn_rem = serial[4:]
-        serial_formatted = f"{vendor_id}:{sn_rem}"
-
-        with self._get_conn() as conn:
-            cursor = conn.cursor()
-            cursor.execute("DELETE FROM test_cases WHERE target_serial = ?", (serial,))
-                    
+        
+        vendor = config.get("global_vendor", "Nokia ISAM7360")
+        if vendor == "Nokia ISAM7360":
+            pon = config['pon']
+            ont_id = config['ont_id']
+            chanpair = config.get('chanpair', '')
+            port_full = f"{pon}/{ont_id}"
+            vendor_id = serial[:4]
+            sn_rem = serial[4:]
+            serial_formatted = f"{vendor_id}:{sn_rem}"
+            slot = config.get('ont_slot', '1')
+            
             templates = {
                 "ONT_Discovery_Check": "show equipment ont status channel-pair {chanpair}", 
                 "Registration_Check": "show equipment ont status channel-pair {chanpair}", 
@@ -382,33 +378,60 @@ class DatabaseManager:
                 "Optics_Signal_Check": "show equipment ont optics {port}",
                 "Optics_Temp_Check": "show equipment ont optics {port}",
                 "Optics_Voltage_Laser_Check": "show equipment ont optics {port}",
-                "UNI_Status": "show ethernet ont operational-data {port}/1/1",
+                "UNI_Status": f"show ethernet ont operational-data {{port}}/{slot}/1",
                 "Software_Info": "show equipment ont interface {port} detail",
                 "Speed_Test": "Native iperf3 Execution", 
-                "MAC_Status": "show vlan bridge-port-fdb {port}/1/1",
+                "MAC_Status": f"show vlan bridge-port-fdb {{port}}/{slot}/1",
                 "Cleanup": "configure equipment ont interface {port} admin-state down ; configure equipment ont no interface {port}"
             }
+        else:
+            # Huawei Placeholder Framework
+            pon = config.get('hw_fsp', '0/1/0')
+            ont_id = config.get('hw_ont_id', '1')
+            port_full = f"{pon} {ont_id}"
+            serial_formatted = serial
+            chanpair = ""
+            slot = ""
+            
+            templates = {
+                "ONT_Discovery_Check": "display ont info {port}", 
+                "Registration_Check": "display ont info {port}", 
+                "Reboot_Test": "ont reset {port}",
+                "Optics_Signal_Check": "display ont optical-info {port}",
+                "Optics_Temp_Check": "display ont optical-info {port}",
+                "Optics_Voltage_Laser_Check": "display ont optical-info {port}",
+                "UNI_Status": "display ont port state {port} eth-port all",
+                "Software_Info": "display ont version {port}",
+                "Speed_Test": "Native iperf3 Execution", 
+                "MAC_Status": "display mac-address port {port}",
+                "Cleanup": "undo ont {port}"
+            }
+
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM test_cases WHERE target_serial = ?", (serial,))
             
             cursor.execute('SELECT test_type, command_template FROM learned_commands WHERE olt_profile = ?', (profile,))
             learned_dict = {row[0]: row[1] for row in cursor.fetchall()}
             
             mock_cases = []
             for i, (t_type, def_cmd) in enumerate(templates.items(), 1):
-                template = learned_dict.get(t_type)
+                template = learned_dict.get(t_type) if vendor == "Nokia ISAM7360" else def_cmd
                 
-                if t_type == "Reboot_Test" and template and "with-active-image" not in template:
-                    template = def_cmd
-                    cursor.execute('INSERT OR REPLACE INTO learned_commands (olt_profile, test_type, command_template) VALUES (?, ?, ?)', (profile, t_type, def_cmd))
-                elif t_type == "UNI_Status" and template and "operational-data" not in template:
-                    template = def_cmd
-                    cursor.execute('INSERT OR REPLACE INTO learned_commands (olt_profile, test_type, command_template) VALUES (?, ?, ?)', (profile, t_type, def_cmd))
-                elif "{port}" in def_cmd and template and "{port}" not in template:
-                    template = def_cmd
-                    cursor.execute('INSERT OR REPLACE INTO learned_commands (olt_profile, test_type, command_template) VALUES (?, ?, ?)', (profile, t_type, def_cmd))
-                elif "{chanpair}" in def_cmd and template and "{chanpair}" not in template:
-                    template = def_cmd
-                    cursor.execute('INSERT OR REPLACE INTO learned_commands (olt_profile, test_type, command_template) VALUES (?, ?, ?)', (profile, t_type, def_cmd))
-                    
+                if vendor == "Nokia ISAM7360":
+                    if t_type == "Reboot_Test" and template and "with-active-image" not in template:
+                        template = def_cmd
+                        cursor.execute('INSERT OR REPLACE INTO learned_commands (olt_profile, test_type, command_template) VALUES (?, ?, ?)', (profile, t_type, def_cmd))
+                    elif t_type == "UNI_Status" and template and "operational-data" not in template:
+                        template = def_cmd
+                        cursor.execute('INSERT OR REPLACE INTO learned_commands (olt_profile, test_type, command_template) VALUES (?, ?, ?)', (profile, t_type, def_cmd))
+                    elif "{port}" in def_cmd and template and "{port}" not in template:
+                        template = def_cmd
+                        cursor.execute('INSERT OR REPLACE INTO learned_commands (olt_profile, test_type, command_template) VALUES (?, ?, ?)', (profile, t_type, def_cmd))
+                    elif "{chanpair}" in def_cmd and template and "{chanpair}" not in template:
+                        template = def_cmd
+                        cursor.execute('INSERT OR REPLACE INTO learned_commands (olt_profile, test_type, command_template) VALUES (?, ?, ?)', (profile, t_type, def_cmd))
+                        
                 if not template:
                     template = def_cmd
                 
@@ -421,15 +444,29 @@ class DatabaseManager:
                     chanpair=chanpair
                 )
                 
-                params = {"timeout": 15, "wait": 0}
-                if t_type == "Registration_Check": params["wait"] = 5
-                elif t_type == "MAC_Status": params["wait"] = 10
-                    
+                params = {"timeout": 15, "wait": 20 if i > 1 else 0}
                 mock_cases.append((serial, i, t_type, cmd, json.dumps(params), "N/T"))
                 
             cursor.executemany("INSERT INTO test_cases (target_serial, execution_order, test_type, command, parameters, status) VALUES (?,?,?,?,?,?)", mock_cases)
             conn.commit()
 
+class HuaweiOLTConnector:
+    """Stub connector for Huawei MA5800-X7 Integration"""
+    def __init__(self, ip: str, user: str, pw: str, proto: str):
+        self.ip = ip
+        self.olt_profile = "Huawei_MA5800"
+        self.vendor = "Huawei"
+        self.model = "MA5800-X7"
+        self.sw_version = "Unknown"
+        self.connection = None
+
+    def connect(self) -> bool:
+        logging.warning("Huawei Connector is initialized but automation sequences are pending full implementation in next patch.")
+        return False
+        
+    def disconnect(self): pass
+
+# --- Original Nokia Connector ---
 class NokiaOLTConnector:
     def __init__(self, ip: str, user: str, pw: str, proto: str):
         self.proto = proto
@@ -461,10 +498,7 @@ class NokiaOLTConnector:
             except Exception: pass
 
     def _discover_profile(self):
-        # [NEW] Updated command for OS version extraction
         out = self.send_command("show software-mngt version ansi", 5)
-        
-        # Robust parsing for software version
         m = re.search(r'(V\d+\.[A-Za-z0-9\.\-_]+|R\d+\.[A-Za-z0-9\.\-_]+|\d{1,3}\.\d{1,3}\.\S+)', out, re.IGNORECASE)
         if m:
             self.sw_version = m.group(1)
@@ -475,7 +509,6 @@ class NokiaOLTConnector:
 
         self.olt_profile = f"Nokia_OS_{self.sw_version}"
 
-        # [NEW] IP-based Hardcoding for specific environment
         if self.device.get('host') == '10.100.0.7':
             self.vendor = "Nokia"
             self.model = "ISAM7360-FWLT-B"
@@ -557,56 +590,68 @@ class NokiaOLTConnector:
         serial_raw = config['ont_serial']
         serial_formatted = self.format_serial(serial_raw)
         
-        reg_key = f"Registration_{config['ont_type'].upper()}"
-        learned_cmds = db.get_learned_command(self.olt_profile, reg_key)
-        
-        if learned_cmds and "admin-state up" not in learned_cmds.lower():
-            logging.warning("Learned registration command is missing critical 'admin-state up' step. Reverting to default sequence.")
-            learned_cmds = None
-        
-        if learned_cmds:
-            cmd_templates = [c.strip() for c in learned_cmds.split(';') if c.strip()]
-        else:
-            if config['ont_type'] == 'sfu':
-                cmd_templates = [
-                    "configure equipment ont interface {port} sw-ver-pland disabled sernum {serial_formatted} fec-up enable sw-dnload-version disabled pref-channel-pair {chanpair}",
-                    "configure equipment ont interface {port} admin-state up",
-                    "configure equipment ont slot {port}/1 planned-card-type ethernet plndnumdataports {lan_ports} plndnumvoiceports 0",
-                    "configure interface port uni:{port}/1/1 admin-up"
-                ]
-            else:
-                cmd_templates = [
-                    "configure equipment ont interface {port} sw-ver-pland disabled sernum {serial_formatted} fec-up enable sw-dnload-version disabled pref-channel-pair {chanpair}",
-                    "configure equipment ont interface {port} admin-state up",
-                    "configure equipment ont slot {port}/14 planned-card-type veip plndnumdataports {lan_ports} plndnumvoiceports 0"
-                ]
-
         logging.info(f"--- [STEP 1] Initiating ONT Registration for {serial_raw} on {port_full} ---")
-        error_kws = ["invalid command", "invalid token", "unknown command", "bad parameter", "incomplete command"]
         
-        while True:
-            success = True
-            for template in cmd_templates:
-                cmd = template.format(
-                    serial_formatted=serial_formatted, port=port_full,
-                    chanpair=config.get('chanpair', ''), lan_ports=config.get('lan_ports', '1')
-                )
+        cmd_intf1 = f"configure equipment ont interface {port_full} sw-ver-pland disabled sernum {serial_formatted} fec-up enable sw-dnload-version disabled pref-channel-pair {config.get('chanpair', '')}"
+        cmd_intf2 = f"configure equipment ont interface {port_full} admin-state up"
+        
+        for c in [cmd_intf1, cmd_intf2]:
+            out = self.send_command(c)
+            if "^" in out or "error" in out.lower():
+                logging.error(f"Command rejected: {c}\n{out}")
+                self._cleanup_failed_provisioning(port_full)
+                return False
                 
-                out = self.send_command(cmd, timeout=10)
-                out_lower = out.lower()
-                if (any(kw in out_lower for kw in error_kws) or "^" in out) and "pattern not detected" not in out_lower:
-                    print(f"\n[ REGISTRATION FAILED ] Command rejected: {cmd}")
+        logging.info("Waiting 5s for hardware to synchronize slots and checking alarms...")
+        time.sleep(5)
+        
+        alarm_out = self.send_command(f"show equipment ont alarm {port_full}")
+        slot_out = self.send_command("show equipment ont slot")
+        
+        alarm_detected = "did not accept the configuration request" in alarm_out or "alarm occurred for ont-card" in alarm_out.lower()
+        
+        available_slots = []
+        for line in slot_out.split('\n'):
+            if port_full in line:
+                m = re.search(rf'{re.escape(port_full)}/(\d+)', line)
+                if m: available_slots.append(m.group(1))
+        available_slots = list(set(available_slots))
+        
+        default_slot = config.get('ont_slot', '1')
+        selected_slot = default_slot
+        
+        if alarm_detected or (available_slots and default_slot not in available_slots):
+            slots_str = ", ".join(available_slots) if available_slots else "None Detected"
+            msg = f"Slot mismatch or Card alarm detected!\nAvailable slots for {port_full}: {slots_str}\n\nEnter correct slot number to use:"
+            new_slot = gui_ask(msg)
+            if new_slot and new_slot.isdigit():
+                selected_slot = new_slot
+            else:
+                logging.error("Slot selection aborted.")
+                self._cleanup_failed_provisioning(port_full)
+                return False
+        elif available_slots and len(available_slots) == 1:
+            selected_slot = available_slots[0]
+            
+        config['ont_slot'] = selected_slot
+        logging.info(f"Selected ONT Slot assigned as: {selected_slot}")
+        
+        card_type = "ethernet" if config.get('ont_type', 'sfu') == 'sfu' else "veip"
+        cmd_card1 = f"configure equipment ont slot {port_full}/{selected_slot} planned-card-type {card_type} plndnumdataports {config.get('lan_ports', '1')} plndnumvoiceports 0"
+        cmd_card2 = f"configure interface port uni:{port_full}/{selected_slot}/1 admin-up"
+        
+        for c in [cmd_card1, cmd_card2]:
+            out = self.send_command(c)
+            if "^" in out or "error" in out.lower():
+                logging.error(f"Card configuration rejected: {c}\n{out}")
+                fix_cmd = gui_ask(f"Card config failed. Enter corrective CLI:")
+                if fix_cmd and fix_cmd.lower() not in ['exit', '4']:
+                    self.send_command(fix_cmd)
+                else:
                     self._cleanup_failed_provisioning(port_full)
-                    
-                    new_cmds = gui_ask("Registration failed. Enter corrective CLI sequence (use ';' for multiple):")
-                    if new_cmds.lower() == 'exit' or not new_cmds: return False
-                        
-                    db.save_learned_command(self.olt_profile, reg_key, new_cmds)
-                    cmd_templates = [c.strip() for c in new_cmds.split(';') if c.strip()]
-                    success = False
-                    break 
-                    
-            if success: return True
+                    return False
+        
+        return True
 
     def verify_registration(self, config: Dict, db: DatabaseManager) -> bool:
         port_full = f"{config['pon']}/{config['ont_id']}"
@@ -644,7 +689,7 @@ class NokiaOLTConnector:
             if choice == '1': continue
             elif choice == '2':
                 new_cmd = gui_ask("Enter new verification command template:")
-                if new_cmd and new_cmd.lower() != 'exit': 
+                if new_cmd and new_cmd.lower() not in ['exit', '4']: 
                     cmd_template = new_cmd
                     db.save_learned_command(self.olt_profile, "Reg_Verify_Cmd", cmd_template)
             elif choice == '3': return True
@@ -652,6 +697,7 @@ class NokiaOLTConnector:
 
     def provision_service_ont(self, config: Dict, db: DatabaseManager) -> bool:
         port_full = f"{config['pon']}/{config['ont_id']}"
+        slot = config.get('ont_slot', '1')
         vlan_mode = config.get('vlan_mode', 'untagged').lower()
         prov_key = f"Provisioning_Service_{config['ont_type'].upper()}_{vlan_mode.upper()}"
         
@@ -663,86 +709,81 @@ class NokiaOLTConnector:
             
         if learned_cmds:
             cmd_templates = [c.strip() for c in learned_cmds.split(';') if c.strip()]
-        else:
-            base_sfu = [
-                "configure qos interface uni:{port}/1/1 queue [0...7] shaper-profile name:StrictPriority",
-                "configure qos interface uni:{port}/1/1 upstream-queue [0...7] bandwidth-profile name:{bw_profile} bandwidth-sharing uni-sharing",
-                "configure bridge port {port}/1/1 max-unicast-mac {max_mac}"
-            ]
-            base_hgu = [
-                "configure bridge port {port}/14/1 max-unicast-mac {max_mac}"
-            ]
             
-            if config['ont_type'] == 'sfu':
-                cmd_templates = base_sfu
-                if vlan_mode == 'untagged':
-                    cmd_templates.extend([
-                        "configure bridge port {port}/1/1 vlan-id {vlan_id} usacceptframetype untagged",
-                        "configure bridge port {port}/1/1 pvid {vlan_id}"
-                    ])
-                elif vlan_mode == 'tagged':
-                    cmd_templates.append("configure bridge port {port}/1/1 vlan-id {vlan_id} tag single-tagged l2fwder-vlan {vlan_id} vlan-scope local")
-                elif vlan_mode == 'translation':
-                    cmd_templates.append("configure bridge port {port}/1/1 vlan-id {c_vlan} tag single-tagged l2fwder-vlan {vlan_id} vlan-scope local")
-            else:
-                cmd_templates = base_hgu
-                if vlan_mode == 'untagged':
-                    cmd_templates.extend([
-                        "configure bridge port {port}/14/1 vlan-id {vlan_id} usacceptframetype untagged",
-                        "configure bridge port {port}/14/1 pvid {vlan_id}"
-                    ])
-                elif vlan_mode == 'tagged':
-                    cmd_templates.append("configure bridge port {port}/14/1 vlan-id {vlan_id} tag single-tagged l2fwder-vlan {vlan_id} vlan-scope local")
-                elif vlan_mode == 'translation':
-                    cmd_templates.append("configure bridge port {port}/14/1 vlan-id {c_vlan} tag single-tagged l2fwder-vlan {vlan_id} vlan-scope local")
-
-        logging.info(f"--- [STEP 3] Initiating Service Provisioning ({vlan_mode.upper()}) on {port_full} ---")
-        error_kws = ["invalid command", "invalid token", "unknown command", "bad parameter", "incomplete command"]
-        
-        while True:
-            success = True
-            for template in cmd_templates:
-                cmd = template.format(
+            cmds_formatted = []
+            for t in cmd_templates:
+                c = t.format(
                     port=port_full, bw_profile=config.get('bw_profile', ''),
                     max_mac=config.get('max_mac', '128'), vlan_id=config.get('vlan_id', '1001'),
                     c_vlan=config.get('c_vlan', '10')
                 )
-                
+                cmds_formatted.append(c)
+        else:
+            cmds_formatted = [
+                f"configure qos interface uni:{port_full}/{slot}/1 queue [0...7] shaper-profile name:StrictPriority",
+                f"configure qos interface uni:{port_full}/{slot}/1 upstream-queue [0...7] bandwidth-profile name:{config.get('bw_profile')} bandwidth-sharing uni-sharing",
+                f"configure bridge port {port_full}/{slot}/1 max-unicast-mac {config.get('max_mac')}"
+            ]
+            
+            if vlan_mode == 'untagged':
+                cmds_formatted.extend([
+                    f"configure bridge port {port_full}/{slot}/1 vlan-id {config.get('vlan_id')} usacceptframetype untagged",
+                    f"configure bridge port {port_full}/{slot}/1 pvid {config.get('vlan_id')}"
+                ])
+            elif vlan_mode == 'tagged':
+                cmds_formatted.append(f"configure bridge port {port_full}/{slot}/1 vlan-id {config.get('vlan_id')} tag single-tagged l2fwder-vlan {config.get('vlan_id')} vlan-scope local")
+            elif vlan_mode == 'translation':
+                cmds_formatted.append(f"configure bridge port {port_full}/{slot}/1 vlan-id {config.get('c_vlan')} tag single-tagged l2fwder-vlan {config.get('vlan_id')} vlan-scope local")
+
+        logging.info(f"--- [STEP 3] Initiating Service Provisioning ({vlan_mode.upper()}) on {port_full}/{slot}/1 ---")
+        error_kws = ["invalid command", "invalid token", "unknown command", "bad parameter", "incomplete command"]
+        
+        while True:
+            success = True
+            for cmd in cmds_formatted:
                 out = self.send_command(cmd, timeout=10)
                 out_lower = out.lower()
                 if (any(kw in out_lower for kw in error_kws) or "^" in out) and "pattern not detected" not in out_lower:
                     print(f"\n[ SERVICE PROVISIONING FAILED ] Command rejected: {cmd}")
                     self._cleanup_failed_provisioning(port_full)
                     new_cmds = gui_ask("Service Provisioning failed. Enter corrective CLI sequence:")
-                    if new_cmds.lower() == 'exit' or not new_cmds: return False 
+                    if new_cmds.lower() in ['exit', '4'] or not new_cmds: return False 
                     db.save_learned_command(self.olt_profile, prov_key, new_cmds)
                     return False 
                     
             if success: return True
 
 class TestAutomationEngine:
-    def __init__(self, db: DatabaseManager, olt: NokiaOLTConnector, config: Dict):
+    def __init__(self, db: DatabaseManager, olt, config: Dict):
         self.db = db
         self.olt = olt
         self.config = config
         self.serial = config['ont_serial']
-        self.pon = config['pon']
-        self.ont_id = config['ont_id']
-        self.chanpair = config.get('chanpair', '')
-        self.port_full = f"{self.pon}/{self.ont_id}"
+        self.vendor = config.get("global_vendor", "Nokia ISAM7360")
         
-        vendor_id = self.serial[:4]
-        sn_rem = self.serial[4:]
-        self.serial_formatted = f"{vendor_id}:{sn_rem}"
+        if self.vendor == "Nokia ISAM7360":
+            self.pon = config['pon']
+            self.ont_id = config['ont_id']
+            self.chanpair = config.get('chanpair', '')
+            self.port_full = f"{self.pon}/{self.ont_id}"
+            vendor_id = self.serial[:4]
+            sn_rem = self.serial[4:]
+            self.serial_formatted = f"{vendor_id}:{sn_rem}"
+        else:
+            self.pon = config.get('hw_fsp', '0/1/0')
+            self.ont_id = config.get('hw_ont_id', '1')
+            self.chanpair = ""
+            self.port_full = f"{self.pon} {self.ont_id}"
+            self.serial_formatted = self.serial
 
-    def execute_tests(self) -> bool:
+    def execute_tests(self):
         scenarios = self.db.load_test_cases(self.serial)
         retry_required = False
         
         for sn in scenarios:
-            logging.info(f"Executing [{sn['order']}] {sn['type']}")
+            logging.info(f"\nExecuting [{sn['order']}] {sn['type']}")
             if "wait" in sn['parameters'] and sn['parameters']['wait'] > 0:
-                logging.info(f"Waiting {sn['parameters']['wait']} seconds...")
+                logging.info(f"Waiting {sn['parameters']['wait']} seconds for hardware synchronization...")
                 time.sleep(sn['parameters']['wait'])
             
             res = ""
@@ -832,7 +873,7 @@ class TestAutomationEngine:
                     res = f"[SPEED_TEST_FAILED] Unexpected error: {e}"
                     logging.error(res)
                     
-            elif sn['type'] == "Reboot_Test":
+            elif sn['type'] == "Reboot_Test" and self.vendor == "Nokia ISAM7360":
                 logging.info("Sending Reboot Command to OLT...")
                 res_initial = self.olt.send_command(sn['command'])
                 
@@ -919,7 +960,7 @@ class TestAutomationEngine:
                 else:
                     res = self.olt.send_command(sn['command'])
                     
-                if sn['type'] == "Software_Info":
+                if sn['type'] == "Software_Info" and self.vendor == "Nokia ISAM7360":
                     match = re.search(r'sw-ver-act\s*:\s*(\S+)', res, re.IGNORECASE)
                     if match:
                         self.config['sw_version'] = match.group(1).upper()
@@ -934,9 +975,16 @@ class TestAutomationEngine:
                     continue
                 
                 action = self._handle_failure(sn, res)
+                
+                if action == "ABORT":
+                    self.db.update_test_status(sn['id'], "FAIL", res)
+                    return "ABORT"
+                    
                 if not action: 
                     self.db.update_test_status(sn['id'], "FAIL", res)
-                    return False 
+                    retry_required = True
+                    break 
+                    
                 if action == "SKIP":
                     logging.info(f"[SKIPPED] {sn['type']}")
                     self.db.update_test_status(sn['id'], "N/A", res)
@@ -957,7 +1005,6 @@ class TestAutomationEngine:
             
         res_lower = res.lower()
         
-        # [CRITICAL FIX] Avoid fallthrough logic for tagged results.
         if t_type == "Reboot_Test":
             return "[REBOOT_SUCCESS]" in res
         if t_type == "Speed_Test":
@@ -967,67 +1014,72 @@ class TestAutomationEngine:
         if any(kw in res_lower for kw in error_kws) or "^" in res: 
             return False
             
-        if t_type == "ONT_Discovery_Check":
-            serial_clean = self.serial.replace(":", "").lower()
-            return serial_clean in res_lower.replace(":", "")
+        if self.vendor == "Nokia ISAM7360":
+            if t_type == "ONT_Discovery_Check":
+                serial_clean = self.serial.replace(":", "").lower()
+                return serial_clean in res_lower.replace(":", "")
 
-        if t_type == "Registration_Check":
-            serial_clean = self.serial.replace(":", "").lower()
-            return "pref-ranged" in res_lower and serial_clean in res_lower.replace(":", "")
-            
-        if t_type in ["Optics_Signal_Check", "Optics_Temp_Check", "Optics_Voltage_Laser_Check"]:
-            success_found = False
-            for line in res.split('\n'):
-                if self.port_full.lower() in line.lower() or self.port_full.split(':')[-1] in line:
-                    tokens = line.strip().split()
-                    port_idx = -1
-                    for i, t in enumerate(tokens):
-                        if self.port_full.lower() in t.lower() or self.port_full.split(':')[-1] in t:
-                            port_idx = i
-                            break
-                    
-                    if port_idx != -1 and len(tokens) >= port_idx + 7:
-                        rx_sig = tokens[port_idx + 1]
-                        tx_sig = tokens[port_idx + 2]
-                        temp = tokens[port_idx + 3]
-                        voltage = tokens[port_idx + 4]
-                        laser = tokens[port_idx + 5]
-                        olt_rx = tokens[port_idx + 6]
+            if t_type == "Registration_Check":
+                serial_clean = self.serial.replace(":", "").lower()
+                return "pref-ranged" in res_lower and serial_clean in res_lower.replace(":", "")
+                
+            if t_type in ["Optics_Signal_Check", "Optics_Temp_Check", "Optics_Voltage_Laser_Check"]:
+                success_found = False
+                for line in res.split('\n'):
+                    if self.port_full.lower() in line.lower() or self.port_full.split(':')[-1] in line:
+                        tokens = line.strip().split()
+                        port_idx = -1
+                        for i, t in enumerate(tokens):
+                            if self.port_full.lower() in t.lower() or self.port_full.split(':')[-1] in t:
+                                port_idx = i
+                                break
                         
-                        def is_num(val):
-                            val_clean = val.lower()
-                            if val_clean in ['invalid', 'not-appl', 'n/a', 'none', '-', 'inf', '-inf']: return False
-                            try:
-                                float(val)
-                                return True
-                            except ValueError:
-                                return False
-                        
-                        if t_type == "Optics_Signal_Check":
-                            success_found = is_num(rx_sig) and is_num(tx_sig) and is_num(olt_rx)
-                        elif t_type == "Optics_Temp_Check":
-                            success_found = is_num(temp)
-                        elif t_type == "Optics_Voltage_Laser_Check":
-                            success_found = is_num(voltage) and is_num(laser)
+                        if port_idx != -1 and len(tokens) >= port_idx + 7:
+                            rx_sig = tokens[port_idx + 1]
+                            tx_sig = tokens[port_idx + 2]
+                            temp = tokens[port_idx + 3]
+                            voltage = tokens[port_idx + 4]
+                            laser = tokens[port_idx + 5]
+                            olt_rx = tokens[port_idx + 6]
                             
-                        if success_found:
-                            break
-            return success_found
-            
-        if t_type == "Software_Info":
-            match = re.search(r'sw-ver-act\s*:\s*(\S+)', res_lower)
-            if match:
-                val = match.group(1)
-                return val not in ["sw-ver-psv", "vendor-id", "unknown"]
-            return False
-            
-        if t_type == "UNI_Status":
-            has_link = "link-status" in res_lower and "up" in res_lower
-            has_speed = "config-indicator" in res_lower and any(s in res_lower for s in ['10g', '1g', '100m', '10m'])
-            return has_link and has_speed
-            
-        if t_type == "MAC_Status": 
-            return bool(re.search(r'([0-9A-F]{2}:){5}[0-9A-F]{2}', res, re.I))
+                            def is_num(val):
+                                val_clean = val.lower()
+                                if val_clean in ['invalid', 'not-appl', 'n/a', 'none', '-', 'inf', '-inf']: return False
+                                try:
+                                    float(val)
+                                    return True
+                                except ValueError:
+                                    return False
+                            
+                            if t_type == "Optics_Signal_Check":
+                                success_found = is_num(rx_sig) and is_num(tx_sig) and is_num(olt_rx)
+                            elif t_type == "Optics_Temp_Check":
+                                success_found = is_num(temp)
+                            elif t_type == "Optics_Voltage_Laser_Check":
+                                success_found = is_num(voltage) and is_num(laser)
+                                
+                            if success_found:
+                                break
+                return success_found
+                
+            if t_type == "Software_Info":
+                match = re.search(r'sw-ver-act\s*:\s*(\S+)', res_lower)
+                if match:
+                    val = match.group(1)
+                    return val not in ["sw-ver-psv", "vendor-id", "unknown"]
+                return False
+                
+            if t_type == "UNI_Status":
+                has_link = "link-status" in res_lower and "up" in res_lower
+                has_speed = "config-indicator" in res_lower and any(s in res_lower for s in ['10g', '1g', '100m', '10m'])
+                return has_link and has_speed
+                
+            if t_type == "MAC_Status": 
+                return bool(re.search(r'([0-9A-F]{2}:){5}[0-9A-F]{2}', res, re.I))
+                
+        else:
+            # Huawei baseline verification (to be expanded)
+            return True
 
         return True
 
@@ -1041,8 +1093,10 @@ class TestAutomationEngine:
         if is_syntax_error and sn['type'] != "Speed_Test":
             print(f"\n[ AI Auto-Detection ] 'Invalid CLI' detected.")
             tmp = gui_ask(f"Enter correct CLI template for {sn['type']} (or type 'exit'):")
-            if tmp.lower() == 'exit': return False
-            if tmp and tmp.lower() != 'exit':
+            if tmp.lower() in ['exit', '4']: 
+                logging.info("User selected ABORT during CLI correction.")
+                return "ABORT"
+            if tmp:
                 self.db.save_learned_command(self.olt.olt_profile, sn['type'], tmp)
                 self.db.update_test_case(sn['id'], tmp.format(serial=self.serial, pon=self.pon, ont_id=self.ont_id, port=self.port_full), json.dumps(sn['parameters']))
                 return True
@@ -1050,7 +1104,7 @@ class TestAutomationEngine:
         choice = gui_ask(f"Error in {sn['type']}. Select Option: [1] Update Cmd [2] Increase Wait [3] Force Pass [4] Abort")
         if choice == "1":
             tmp = gui_ask(f"Enter new template for {sn['type']}:")
-            if tmp and tmp.lower() != 'exit':
+            if tmp and tmp.lower() not in ['exit', '4']:
                 self.db.save_learned_command(self.olt.olt_profile, sn['type'], tmp)
                 self.db.update_test_case(sn['id'], tmp.format(serial=self.serial, pon=self.pon, ont_id=self.ont_id, port=self.port_full), json.dumps(sn['parameters']))
             return True
@@ -1061,7 +1115,12 @@ class TestAutomationEngine:
         elif choice == "3":
             logging.info(f"Force passing {sn['type']} step.")
             return "SKIP"
-        return False
+        elif choice in ["4", "exit"]:
+            logging.warning("User manually initiated ABORT sequence.")
+            return "ABORT"
+        else:
+            logging.warning("Invalid input received. Defaulting to ABORT.")
+            return "ABORT"
 
 # ==========================================
 # GUI Application Layer
@@ -1071,8 +1130,8 @@ class AutomationGUI:
         global GUI_ROOT
         GUI_ROOT = root
         self.root = root
-        self.root.title("ONT Automation Tool v2.0")
-        self.root.geometry("1100x800")
+        self.root.title("ONT Automation Tool v2.0 (Multi-Vendor)")
+        self.root.geometry("1100x850")
         self.root.configure(bg="#2E3440")
         
         self.db = DatabaseManager()
@@ -1098,23 +1157,48 @@ class AutomationGUI:
         logging.getLogger().addHandler(handler)
         logging.getLogger().setLevel(logging.INFO)
 
+    def on_vendor_change(self, event=None):
+        vendor = self.cb_global_vendor.get()
+        if vendor == "Nokia ISAM7360":
+            self.nokia_target_frame.pack(fill=tk.BOTH, expand=True)
+            self.huawei_target_frame.pack_forget()
+            
+            self.nokia_svc_frame.pack(fill=tk.BOTH, expand=True)
+            self.huawei_svc_frame.pack_forget()
+        else:
+            self.nokia_target_frame.pack_forget()
+            self.huawei_target_frame.pack(fill=tk.BOTH, expand=True)
+            
+            self.nokia_svc_frame.pack_forget()
+            self.huawei_svc_frame.pack(fill=tk.BOTH, expand=True)
+
     def setup_ui(self):
         style = ttk.Style()
         style.theme_use("clam")
         
-        # Left Panel: Settings (Notebook)
         left_frame = tk.Frame(self.root, bg="#2E3440", width=400)
         left_frame.pack(side=tk.LEFT, fill=tk.Y, padx=10, pady=10)
         left_frame.pack_propagate(False)
 
+        # Global Vendor Selector
+        vendor_frame = tk.Frame(left_frame, bg="#2E3440")
+        vendor_frame.pack(fill=tk.X, pady=(0, 10))
+        tk.Label(vendor_frame, text="Select Target OLT:", bg="#2E3440", fg="white", font=("Arial", 10, "bold")).pack(side=tk.LEFT)
+        self.cb_global_vendor = ttk.Combobox(vendor_frame, values=["Nokia ISAM7360", "Huawei MA5800-X7"], state="readonly")
+        self.cb_global_vendor.set(self.config.get("global_vendor", "Nokia ISAM7360"))
+        self.cb_global_vendor.pack(side=tk.LEFT, padx=10, fill=tk.X, expand=True)
+        self.cb_global_vendor.bind("<<ComboboxSelected>>", self.on_vendor_change)
+
         self.notebook = ttk.Notebook(left_frame)
         self.notebook.pack(fill=tk.BOTH, expand=True)
 
-        # Tab 1: OLT & Targeting
-        tab_tgt = ttk.Frame(self.notebook)
-        self.notebook.add(tab_tgt, text="Target & Connection")
+        # ---------------------------------------------------------
+        # Tab 1: Target & Connection
+        # ---------------------------------------------------------
+        self.tab_tgt = ttk.Frame(self.notebook)
+        self.notebook.add(self.tab_tgt, text="Target & Connection")
         
-        info_frame = ttk.LabelFrame(tab_tgt, text="OLT System Info")
+        info_frame = ttk.LabelFrame(self.tab_tgt, text="OLT System Info")
         info_frame.pack(fill=tk.X, padx=10, pady=5)
         self.lbl_vendor = ttk.Label(info_frame, text="Vendor: -")
         self.lbl_vendor.pack(anchor='w', padx=5, pady=2)
@@ -1123,33 +1207,55 @@ class AutomationGUI:
         self.lbl_sw_ver = ttk.Label(info_frame, text="SW Version: -")
         self.lbl_sw_ver.pack(anchor='w', padx=5, pady=2)
         
-        self.sv_olt_ip = self.add_entry(tab_tgt, "OLT IP:", self.config.get("olt_ip", ""))
-        self.sv_username = self.add_entry(tab_tgt, "Username:", self.config.get("username", "isadmin"))
-        self.sv_password = self.add_entry(tab_tgt, "Password:", self.config.get("password", ""), show="*")
+        self.sv_olt_ip = self.add_entry(self.tab_tgt, "OLT IP:", self.config.get("olt_ip", ""))
+        self.sv_username = self.add_entry(self.tab_tgt, "Username:", self.config.get("username", "isadmin"))
+        self.sv_password = self.add_entry(self.tab_tgt, "Password:", self.config.get("password", ""), show="*")
         
-        ttk.Separator(tab_tgt, orient='horizontal').pack(fill='x', pady=10)
+        ttk.Separator(self.tab_tgt, orient='horizontal').pack(fill='x', pady=10)
         
-        self.sv_serial = self.add_entry(tab_tgt, "ONT Serial:", self.config.get("ont_serial", ""))
-        self.sv_chanpair = self.add_entry(tab_tgt, "Channel Pair:", self.config.get("chanpair", "1/1/1/3"))
-        self.sv_pon = self.add_entry(tab_tgt, "Target PON:", self.config.get("pon", "ng2:3/1"))
-        self.sv_ont_id = self.add_entry(tab_tgt, "Target ONT ID:", self.config.get("ont_id", "1"))
+        self.sv_serial = self.add_entry(self.tab_tgt, "ONT Serial / SN:", self.config.get("ont_serial", ""))
+        
+        # Dynamic Target Frames
+        self.nokia_target_frame = tk.Frame(self.tab_tgt)
+        self.sv_chanpair = self.add_entry(self.nokia_target_frame, "Channel Pair:", self.config.get("chanpair", "1/1/1/3"))
+        self.sv_pon = self.add_entry(self.nokia_target_frame, "Target PON:", self.config.get("pon", "ng2:3/1"))
+        self.sv_ont_id = self.add_entry(self.nokia_target_frame, "Target ONT ID:", self.config.get("ont_id", "1"))
+        
+        self.huawei_target_frame = tk.Frame(self.tab_tgt)
+        self.sv_hw_fsp = self.add_entry(self.huawei_target_frame, "Target F/S/P:", self.config.get("hw_fsp", "0/1/0"))
+        self.sv_hw_ont_id = self.add_entry(self.huawei_target_frame, "Target ONT ID:", self.config.get("hw_ont_id", "1"))
 
+        # ---------------------------------------------------------
         # Tab 2: Service Config
-        tab_svc = ttk.Frame(self.notebook)
-        self.notebook.add(tab_svc, text="Service & VLAN")
+        # ---------------------------------------------------------
+        self.tab_svc = ttk.Frame(self.notebook)
+        self.notebook.add(self.tab_svc, text="Service & VLAN")
         
-        self.cb_ont_type = self.add_combobox(tab_svc, "ONT Type:", ["sfu", "hgu"], self.config.get("ont_type", "sfu"))
-        self.sv_lan_ports = self.add_entry(tab_svc, "LAN Ports:", self.config.get("lan_ports", "1"))
-        self.sv_max_mac = self.add_entry(tab_svc, "Max MAC:", self.config.get("max_mac", "16"))
-        self.sv_bw_profile = self.add_entry(tab_svc, "BW Profile Name:", self.config.get("bw_profile", "NG2DATABWUP10000"))
+        self.cb_ont_type = self.add_combobox(self.tab_svc, "ONT Type:", ["sfu", "hgu"], self.config.get("ont_type", "sfu"))
+        self.sv_lan_ports = self.add_entry(self.tab_svc, "LAN Ports:", self.config.get("lan_ports", "1"))
+        self.sv_max_mac = self.add_entry(self.tab_svc, "Max MAC:", self.config.get("max_mac", "16"))
         
-        ttk.Separator(tab_svc, orient='horizontal').pack(fill='x', pady=10)
+        # Dynamic Service Frames
+        self.nokia_svc_frame = tk.Frame(self.tab_svc)
+        self.sv_ont_slot = self.add_entry(self.nokia_svc_frame, "ONT Slot (Data):", self.config.get("ont_slot", "1"))
+        self.sv_bw_profile = self.add_entry(self.nokia_svc_frame, "BW Profile Name:", self.config.get("bw_profile", "NG2DATABWUP10000"))
         
-        self.cb_vlan_mode = self.add_combobox(tab_svc, "VLAN Mode:", ["untagged", "tagged", "translation"], self.config.get("vlan_mode", "untagged"))
-        self.sv_vlan_id = self.add_entry(tab_svc, "Service VLAN ID:", self.config.get("vlan_id", "1001"))
-        self.sv_cvlan = self.add_entry(tab_svc, "C-VLAN (Translation):", self.config.get("c_vlan", "10"))
+        self.huawei_svc_frame = tk.Frame(self.tab_svc)
+        self.sv_hw_line_prof = self.add_entry(self.huawei_svc_frame, "Line Profile ID:", self.config.get("hw_line_prof", "10"))
+        self.sv_hw_srv_prof = self.add_entry(self.huawei_svc_frame, "Service Profile ID:", self.config.get("hw_srv_prof", "10"))
+        
+        ttk.Separator(self.tab_svc, orient='horizontal').pack(fill='x', pady=10)
+        
+        self.cb_vlan_mode = self.add_combobox(self.tab_svc, "VLAN Mode:", ["untagged", "tagged", "translation"], self.config.get("vlan_mode", "untagged"))
+        self.sv_vlan_id = self.add_entry(self.tab_svc, "Service VLAN ID:", self.config.get("vlan_id", "1001"))
+        self.sv_cvlan = self.add_entry(self.tab_svc, "C-VLAN (Translation):", self.config.get("c_vlan", "10"))
 
+        # Initialize the correct view based on saved config
+        self.on_vendor_change()
+
+        # ---------------------------------------------------------
         # Tab 3: Speed Test
+        # ---------------------------------------------------------
         tab_spd = ttk.Frame(self.notebook)
         self.notebook.add(tab_spd, text="Speed Test Config")
         
@@ -1194,20 +1300,31 @@ class AutomationGUI:
         return cb
 
     def update_config_from_ui(self):
+        self.config['global_vendor'] = self.cb_global_vendor.get()
+        
         self.config['olt_ip'] = self.sv_olt_ip.get()
         self.config['username'] = self.sv_username.get()
         self.config['password'] = self.sv_password.get()
         self.config['protocol'] = "telnet"
         
         self.config['ont_serial'] = self.sv_serial.get()
+        
+        # Nokia Fields
         self.config['chanpair'] = self.sv_chanpair.get()
         self.config['pon'] = self.sv_pon.get()
         self.config['ont_id'] = self.sv_ont_id.get()
+        self.config['ont_slot'] = self.sv_ont_slot.get() 
+        self.config['bw_profile'] = self.sv_bw_profile.get()
+        
+        # Huawei Fields
+        self.config['hw_fsp'] = self.sv_hw_fsp.get()
+        self.config['hw_ont_id'] = self.sv_hw_ont_id.get()
+        self.config['hw_line_prof'] = self.sv_hw_line_prof.get()
+        self.config['hw_srv_prof'] = self.sv_hw_srv_prof.get()
         
         self.config['ont_type'] = self.cb_ont_type.get()
         self.config['lan_ports'] = self.sv_lan_ports.get()
         self.config['max_mac'] = self.sv_max_mac.get()
-        self.config['bw_profile'] = self.sv_bw_profile.get()
         self.config['vlan_mode'] = self.cb_vlan_mode.get()
         self.config['vlan_id'] = self.sv_vlan_id.get()
         self.config['c_vlan'] = self.sv_cvlan.get()
@@ -1232,10 +1349,17 @@ class AutomationGUI:
         threading.Thread(target=target_func, args=args, daemon=True).start()
 
     def get_connector(self):
-        if not self.olt or not self.olt.connection or not self.olt.connection.is_alive():
+        vendor = self.cb_global_vendor.get()
+        
+        if vendor == "Huawei MA5800-X7":
+            self.olt = HuaweiOLTConnector(self.config['olt_ip'], self.config['username'], self.config['password'], self.config['protocol'])
+            self.olt.connect()
+            return self.olt
+            
+        if not self.olt or not self.olt.connection or not self.olt.connection.is_alive() or isinstance(self.olt, HuaweiOLTConnector):
             self.olt = NokiaOLTConnector(self.config['olt_ip'], self.config['username'], self.config['password'], self.config['protocol'])
             if not self.olt.connect():
-                logging.error("Failed to connect to OLT. Check IP/Credentials.")
+                logging.error("Failed to connect to Nokia OLT. Check IP/Credentials.")
                 return None
             else:
                 self.root.after(0, self.update_olt_info_display, self.olt.vendor, self.olt.model, self.olt.sw_version)
@@ -1272,6 +1396,10 @@ class AutomationGUI:
         olt = self.get_connector()
         if not olt: return
         
+        if isinstance(olt, HuaweiOLTConnector):
+            logging.warning("Huawei scan logic is not fully implemented yet.")
+            return
+
         print("\n" + "="*50)
         logging.info(f"Starting {scan_type.upper()} ONT Scan...")
         
@@ -1324,6 +1452,10 @@ class AutomationGUI:
         olt = self.get_connector()
         if not olt: return
         
+        if isinstance(olt, HuaweiOLTConnector):
+            logging.warning("Huawei delete logic is not fully implemented yet.")
+            return
+
         port_full = f"{self.config['pon']}/{self.config['ont_id']}"
         confirm = messagebox.askyesno("Confirm Deletion", f"Are you sure you want to delete ONT on port {port_full}?")
         if confirm:
@@ -1335,13 +1467,15 @@ class AutomationGUI:
         olt = self.get_connector()
         if not olt: return
         
+        if isinstance(olt, HuaweiOLTConnector):
+            logging.warning("Huawei automation pipeline will be activated in the next patch.")
+            return
+
         port_full = f"{self.config['pon']}/{self.config['ont_id']}"
         print("\n" + "="*60)
-        logging.info("Starting Automation Sequence...")
+        logging.info("Starting Nokia Automation Sequence...")
         
         try:
-            self.db.add_initial_test_cases(self.config, olt.olt_profile)
-
             if not skip_provisioning:
                 while True:
                     if not olt.register_ont(self.config, self.db): 
@@ -1357,12 +1491,31 @@ class AutomationGUI:
                         return
                     break 
                 self.db.add_ont(self.config['ont_serial'], self.config['pon'], self.config['ont_id'], "PROVISIONED")
+            else:
+                logging.info("Checking current slot assignment for Test Only mode...")
+                slot_out = olt.send_command("show equipment ont slot")
+                available_slots = []
+                for line in slot_out.split('\n'):
+                    if port_full in line:
+                        m = re.search(rf'{re.escape(port_full)}/(\d+)', line)
+                        if m: available_slots.append(m.group(1))
+                if available_slots:
+                    self.config['ont_slot'] = available_slots[0]
+                else:
+                    tmp = gui_ask("Could not detect slot. Enter slot number:")
+                    self.config['ont_slot'] = tmp if tmp and tmp not in ['exit', '4'] else "1"
+
+            self.db.add_initial_test_cases(self.config, olt.olt_profile)
 
             engine = TestAutomationEngine(self.db, olt, self.config)
             for cycle in range(1, 10):
                 logging.info(f"\n========== TEST CYCLE {cycle} ==========")
-                if engine.execute_tests(): 
+                test_result = engine.execute_tests()
+                if test_result == True: 
                     logging.info("ALL TESTS PASSED SUCCESSFULLY!")
+                    break
+                elif test_result == "ABORT":
+                    logging.warning("Testing manually aborted by user. Terminating further cycles.")
                     break
         except Exception as e:
             logging.error(f"Critical error during automation: {e}")
