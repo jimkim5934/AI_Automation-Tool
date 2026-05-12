@@ -1,4 +1,4 @@
-# Nokia OLT Autonomous Testing Framework
+# GPON/XGSPON OLT Autonomous Testing Framework
 
 ## Overview
 This project is an automated provisioning and continuous learning testing framework for Nokia OLTs. It manages SFU ONT registration, stores inventory data, and executes test scenarios. The framework includes an evolution mechanism that identifies consistently successful tests and adapts them for stricter or more advanced future testing cycles.
